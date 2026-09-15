@@ -12,6 +12,7 @@ import subprocess
 import urllib.parse
 import json
 import argparse
+import shutil
 from pathlib import Path
 
 __version__ = "0.1.0"
@@ -144,7 +145,7 @@ GPU_DATABASE = {
 }
 
 # ──────────────────────────────────────────────────────────────────────
-# 2. DETECTION (Registry-first on Windows, lspci on Linux)
+# 2. DETECTION
 # ──────────────────────────────────────────────────────────────────────
 
 def _run(cmd: list[str], shell: bool = False) -> str:
@@ -165,11 +166,8 @@ def detect_os() -> str:
     return "unknown"
 
 def detect_shell() -> str:
-    """Detect if user is running CMD or PowerShell on Windows."""
     if detect_os() != "windows":
         return "bash"
-    # CMD always sets PROMPT. PowerShell does not.
-    # PSModulePath can leak into CMD so it's unreliable alone.
     if os.environ.get("PROMPT") and not os.environ.get("PSExecutionPolicyPreference"):
         return "cmd"
     if os.environ.get("PSModulePath"):
@@ -177,10 +175,6 @@ def detect_shell() -> str:
     return "cmd"
 
 def _detect_windows_registry() -> list[dict]:
-    """
-    Read GPU info directly from the Windows Registry.
-    This is the most reliable method — works even when wmic is broken.
-    """
     gpus = []
     try:
         import winreg
@@ -198,17 +192,14 @@ def _detect_windows_registry() -> list[dict]:
                     if subkey_name in ("Properties",):
                         continue
                     with winreg.OpenKey(class_key, subkey_name) as subkey:
-                        # Read the display adapter name
                         try:
                             desc = winreg.QueryValueEx(subkey, "DriverDesc")[0]
                         except FileNotFoundError:
                             continue
 
-                        # Skip non-AMD cards
                         if not any(v in desc.lower() for v in ["amd", "radeon", "ati"]):
                             continue
 
-                        # Read the PCI hardware ID
                         pci_id = "unknown"
                         raw_pnp = desc
                         try:
@@ -220,7 +211,6 @@ def _detect_windows_registry() -> list[dict]:
                         except FileNotFoundError:
                             pass
 
-                        # Read driver version
                         driver = "unknown"
                         try:
                             driver = winreg.QueryValueEx(subkey, "DriverVersion")[0]
@@ -240,7 +230,6 @@ def _detect_windows_registry() -> list[dict]:
     return gpus
 
 def _detect_windows_wmic() -> list[dict]:
-    """Fallback: try wmic if registry didn't work."""
     gpus = []
     output = _run(["wmic", "path", "win32_VideoController",
                     "get", "Name,PNPDeviceID,DriverVersion", "/format:list"])
@@ -270,7 +259,6 @@ def _detect_windows_wmic() -> list[dict]:
     return gpus
 
 def _detect_linux() -> list[dict]:
-    """Detect AMD GPUs on Linux using lspci."""
     gpus = []
     output = _run(["lspci", "-nn", "-d", "1002::"])
     pattern = re.compile(r"\[1002:([0-9a-fA-F]{4})\]")
@@ -298,10 +286,8 @@ def _detect_linux() -> list[dict]:
     return gpus
 
 def detect_gpus() -> list[dict]:
-    """Main detection entry point."""
     os_name = detect_os()
     if os_name == "windows":
-        # Registry is most reliable, wmic is fallback
         gpus = _detect_windows_registry()
         if not gpus:
             gpus = _detect_windows_wmic()
@@ -401,7 +387,98 @@ def run_smoke_test(override: str | None) -> dict:
     return {"success": False, "message": "Unsupported OS", "details": ""}
 
 # ──────────────────────────────────────────────────────────────────────
-# 4. REPORTING
+# 4. AUTO-INSTALL LOGIC (Global command registrar)
+# ──────────────────────────────────────────────────────────────────────
+
+def is_installed_globally() -> bool:
+    """Check if the command 'rocmfix' is callable on PATH."""
+    return shutil.which("rocmfix") is not None
+
+def install_globally() -> bool:
+    """Interactively configure the tool as a global command."""
+    os_name = detect_os()
+    script_path = Path(__file__).resolve()
+    script_dir = script_path.parent
+
+    print(f"\n{C.BOLD}{C.CYAN}⚙️ Automatic Global Command Setup{C.RESET}")
+    print("This will let you run 'rocmfix' from any folder on your computer.\n")
+    
+    confirm = input("Would you like to register 'rocmfix' globally? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print(f"{C.GRAY}Skip registration.{C.RESET}\n")
+        return False
+
+    if os_name == "windows":
+        # 1. Create rocmfix.bat wrapper
+        bat_path = script_dir / "rocmfix.bat"
+        try:
+            bat_path.write_text(f'@echo off\npython "{script_path}" %*\n')
+        except Exception as e:
+            print(f"{C.RED}Failed to create batch wrapper: {e}{C.RESET}")
+            return False
+
+        # 2. Add to user registry path
+        try:
+            import winreg
+            import ctypes
+
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_ALL_ACCESS)
+            try:
+                path_val, _ = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                path_val = ""
+
+            paths = [p.strip().rstrip("\\/") for p in path_val.split(";")]
+            current_dir_str = str(script_dir).rstrip("\\/")
+
+            if current_dir_str not in paths:
+                new_path = path_val + ";" + str(script_dir) if path_val else str(script_dir)
+                winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, new_path)
+                
+                # Force Windows to reload environment variables instantly
+                HWND_BROADCAST = 0xFFFF
+                WM_SETTINGCHANGE = 0x001A
+                ctypes.windll.user32.SendMessageTimeoutW(
+                    HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", 2, 5000, ctypes.byref(ctypes.c_long())
+                )
+                print(f"\n{C.GREEN}✓ Successfully added '{script_dir}' to your user PATH.{C.RESET}")
+                print(f"{C.YELLOW}⚠ Please close this terminal and open a NEW one for the command to work.{C.RESET}\n")
+            else:
+                print(f"\n{C.GREEN}✓ 'rocmfix' is already registered in your PATH.{C.RESET}\n")
+            
+            winreg.CloseKey(key)
+            return True
+        except Exception as e:
+            print(f"{C.RED}Failed to edit Windows PATH Registry: {e}{C.RESET}")
+            return False
+
+    elif os_name == "linux":
+        # For Linux, save to ~/.local/bin as 'rocmfix' (Standard Linux convention, no extension)
+        local_bin = Path.home() / ".local" / "bin"
+        local_bin.mkdir(parents=True, exist_ok=True)
+        dest_file = local_bin / "rocmfix"
+
+        try:
+            shutil.copy2(script_path, dest_file)
+            dest_file.chmod(0o755)  # Make executable
+            print(f"\n{C.GREEN}✓ Copied to {dest_file} (no extension) and made executable.{C.RESET}")
+
+            # Verify PATH
+            if str(local_bin) not in os.environ.get("PATH", ""):
+                print(f"{C.YELLOW}⚠ {local_bin} is not in your current PATH variable.{C.RESET}")
+                print(f"  Add this line to your ~/.bashrc or ~/.zshrc file:")
+                print(f"  {C.BOLD}export PATH=\"$HOME/.local/bin:$PATH\"{C.RESET}\n")
+            else:
+                print(f"{C.GREEN}✓ 'rocmfix' global command is ready!{C.RESET}\n")
+            return True
+        except Exception as e:
+            print(f"{C.RED}Failed to copy binary file: {e}{C.RESET}")
+            return False
+
+    return False
+
+# ──────────────────────────────────────────────────────────────────────
+# 5. REPORTING UTILS
 # ──────────────────────────────────────────────────────────────────────
 
 class C:
@@ -427,7 +504,6 @@ def enable_ansi():
             C.RESET = ""
 
 def format_env_command(override: str) -> str:
-    """Print the right command for the user's actual shell."""
     os_name = detect_os()
     shell = detect_shell()
     lines = []
@@ -470,7 +546,7 @@ def get_issue_url(gpu: dict, rocm_ver: str | None) -> str:
     return f"https://github.com/{GITHUB_REPO}/issues/new?{params}"
 
 # ──────────────────────────────────────────────────────────────────────
-# 5. CLI
+# 6. CLI
 # ──────────────────────────────────────────────────────────────────────
 
 def print_header():
@@ -486,12 +562,28 @@ def main():
 
     parser = argparse.ArgumentParser(description="ROCmFix: AMD GPU override helper")
     parser.add_argument("command", nargs="?", default="detect",
-                        choices=["detect", "test", "list", "contribute"])
+                        choices=["detect", "test", "list", "contribute", "install"])
     args = parser.parse_args()
+
+    # ── FORCE GLOBAL INSTALL ────────────────────────────────
+    if args.command == "install":
+        print_header()
+        install_globally()
+        sys.exit(0)
+
+    # ── FIRST RUN INTERACTIVE CHECK ─────────────────────────
+    # If the app is run from double-click or python directly and hasn't been registered yet.
+    if args.command == "detect" and not is_installed_globally():
+        print_header()
+        install_globally()
+        print(f"{C.GRAY}Continuing to system diagnostics...{C.RESET}\n")
 
     # ── DETECT ──────────────────────────────────────────────
     if args.command == "detect":
-        print_header()
+        # Skip header printing if we already did it in the install loop
+        if is_installed_globally():
+            print_header()
+
         os_name = detect_os()
         shell = detect_shell()
         rocm_ver = detect_rocm_version()
@@ -538,7 +630,7 @@ def main():
                 print()
                 print(format_env_command(info["override"]))
                 print()
-                print(f"      Then verify with: {C.CYAN}python rocmfix.py test{C.RESET}")
+                print(f"      Then verify with: {C.CYAN}rocmfix test{C.RESET}")
                 print(f"      Notes: {info['notes']}")
 
     # ── TEST ────────────────────────────────────────────────
