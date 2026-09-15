@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rocmfix"
-version = "0.1.0"
+version = "0.1.1"
 description = "Auto-detect AMD GPUs and suggest ROCm HSA_OVERRIDE_GFX_VERSION values"
 readme = "README.md"
 requires-python = ">=3.10"

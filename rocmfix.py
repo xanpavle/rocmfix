@@ -15,7 +15,7 @@ import argparse
 import shutil
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 GITHUB_REPO = "xanpavle/rocmfix"
 
 # ──────────────────────────────────────────────────────────────────────
