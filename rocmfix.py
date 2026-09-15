@@ -562,7 +562,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="ROCmFix: AMD GPU override helper")
     parser.add_argument("command", nargs="?", default="detect",
-                        choices=["detect", "test", "list", "contribute", "install"])
+                        choices=["detect", "test", "list", "contribute", "install", "verify"])
     args = parser.parse_args()
 
     # ── FORCE GLOBAL INSTALL ────────────────────────────────
@@ -676,6 +676,37 @@ def main():
         print(f'        "supported": {ov == ""},')
         print(f'        "known_issues": [], "notes": "{notes}"')
         print("    },")
+
+    # ── VERIFY ──────────────────────────────────────────────
+    elif args.command == "verify":
+        print_header()
+        print("  Verify a specific PCI ID + override combination.\n")
+        pci_id = input("  PCI ID to verify (4 hex): ").strip().lower()
+        override = input("  Override value to test (e.g. 11.0.0): ").strip()
+
+        info = GPU_DATABASE.get(pci_id)
+        if info:
+            print(f"\n  {C.YELLOW}This GPU is already in the database:{C.RESET}")
+            print(f"    Name:     {info['name']}")
+            print(f"    Override: {info['override'] or 'None'}")
+            print(f"    Status:   {'Supported' if info['supported'] else 'Override'}")
+            if override and override != (info['override'] or ''):
+                print(f"\n  {C.RED}⚠ Your override ({override}) differs from database ({info['override']}).{C.RESET}")
+                print(f"    If yours works better, please open an issue!")
+        else:
+            print(f"\n  {C.CYAN}PCI {pci_id} is NOT in the database yet.{C.RESET}")
+
+        print(f"\n  Running smoke test with HSA_OVERRIDE_GFX_VERSION={override}...\n")
+        result = run_smoke_test(override if override else None)
+        if result["success"]:
+            print(f"  {C.GREEN}✓ PASS: {result['message']}{C.RESET}")
+            print(f"\n  {C.BOLD}This override works! Please submit it:{C.RESET}")
+            print(f"  {C.BLUE}https://github.com/{GITHUB_REPO}/issues/new?template=gpu-report.yml{C.RESET}")
+        else:
+            print(f"  {C.RED}✗ FAIL: {result['message']}{C.RESET}")
+            if result["details"]:
+                print(f"  {C.GRAY}{result['details']}{C.RESET}")
+            print(f"\n  Try a different override value or check your ROCm/HIP installation.")
 
 if __name__ == "__main__":
     main()
