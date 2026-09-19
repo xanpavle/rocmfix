@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ROCmFix v0.1.3 — Cross-platform AMD GPU override detector and tester for ROCm/HIP.
-Includes full diagnostics (Doctor), HIP Auto-Installer, and Vulkan vs HIP Benchmarker.
+ROCmFix v0.1.4 — Cross-platform AMD GPU override detector and tester for ROCm/HIP.
+Adds: self-updater, live DB sync, LM Studio bench, benchmark telemetry, system export.
 """
 
 import os
@@ -19,142 +19,59 @@ import uuid
 import time
 import webbrowser
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 GITHUB_REPO = "xanpavle/rocmfix"
 
-# ── Telemetry configuration ───────────────────────────────────────────
 TELEMETRY_ENDPOINT = "https://rocmfix-data.onrender.com/submit"
-TELEMETRY_TIMEOUT = 60  # Render free cold start can be slow
+DATABASE_ENDPOINT = "https://rocmfix-data.onrender.com/gpus.json"
+UPDATE_CHECK_ENDPOINT = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_DOWNLOAD_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/rocmfix.py"
+TELEMETRY_TIMEOUT = 60
 
-# ── User config paths ─────────────────────────────────────────────────
 CONFIG_DIR = Path.home() / ".rocmfix"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 OUTBOX_DIR = CONFIG_DIR / "outbox"
 BACKUP_DIR = CONFIG_DIR / "backups"
+DB_CACHE_FILE = CONFIG_DIR / "db_cache.json"
+DB_CACHE_TTL_HOURS = 24
+UPDATE_CHECK_TTL_HOURS = 168  # 7 days
 
 # ──────────────────────────────────────────────────────────────────────
-# 1. DATABASE
+# FALLBACK DATABASE (used offline or if fetch fails)
 # ──────────────────────────────────────────────────────────────────────
 
-GPU_DATABASE = {
-    # ── RDNA 4 ──────────────────────────────
-    "7550": {
-        "name": "RX 9070 XT / 9070 / 9070 GRE (Navi 48)", "arch": "RDNA4", "gfx_target": "gfx1201",
-        "override": None, "supported": True, "rec_backend": "vulkan",
-        "known_issues": ["Requires ROCm 6.4+ or Adrenalin 25.x+ for native support", "Older ROCm may need HSA_OVERRIDE_GFX_VERSION=12.0.0"],
-        "notes": "Natively supported in ROCm 6.4+. If on older ROCm, try override 12.0.0."
-    },
-    "7551": {
-        "name": "Radeon AI PRO R9700 (Navi 48 Pro)", "arch": "RDNA4", "gfx_target": "gfx1201",
-        "override": None, "supported": True, "rec_backend": "hip", "known_issues": [],
-        "notes": "Enterprise variant of Navi 48. Natively supported in ROCm 6.4+."
-    },
-    "7590": {
-        "name": "RX 9060 XT / 9060 / 9050 (Navi 44)", "arch": "RDNA4", "gfx_target": "gfx1200",
-        "override": "12.0.1", "supported": False, "rec_backend": "vulkan",
-        "known_issues": ["gfx1200 support in ROCm is newer than gfx1201", "Vulkan backend recommended for now"],
-        "notes": "Override to gfx1201 (12.0.1). Vulkan may be more stable currently."
-    },
-    # ── RDNA 3 ──────────────────────────────────────────────
-    "744c": {
-        "name": "RX 7900 XTX", "arch": "RDNA3", "gfx_target": "gfx1100",
-        "override": None, "supported": True, "rec_backend": "hip", "known_issues": [],
-        "notes": "Natively supported. No override needed."
-    },
-    "744e": {
-        "name": "RX 7900 XT", "arch": "RDNA3", "gfx_target": "gfx1100",
-        "override": None, "supported": True, "rec_backend": "hip", "known_issues": [],
-        "notes": "Natively supported. No override needed."
-    },
-    "747e": {
-        "name": "RX 7900 GRE / RX 7800 XT (variant)", "arch": "RDNA3", "gfx_target": "gfx1100",
-        "override": None, "supported": True, "rec_backend": "vulkan",
-        "known_issues": ["Some 7800 XT AIB models share this PCI ID but are gfx1101 internally", "If llama.cpp fails with HIP errors, try override 11.0.0"],
-        "notes": "Usually natively supported. If your card is actually a 7800 XT variant and HIP fails, set override to 11.0.0."
-    },
-    "7470": {
-        "name": "RX 7800 XT", "arch": "RDNA3", "gfx_target": "gfx1101",
-        "override": "11.0.0", "supported": False, "rec_backend": "vulkan",
-        "known_issues": ["FP16 atomic operations may produce incorrect results", "Flash Attention 2 may fail on certain model sizes"],
-        "notes": "Override to gfx1100. Works well for llama.cpp and most GGUF inference."
-    },
-    "7471": {
-        "name": "RX 7700 XT", "arch": "RDNA3", "gfx_target": "gfx1101",
-        "override": "11.0.0", "supported": False, "rec_backend": "vulkan",
-        "known_issues": ["FP16 atomic operations may produce incorrect results", "Some custom HIP kernels using wave32 mode may crash"],
-        "notes": "Same override as 7800 XT. 12GB VRAM limits larger models."
-    },
-    "7480": {
-        "name": "RX 7600", "arch": "RDNA3", "gfx_target": "gfx1102",
-        "override": "11.0.0", "supported": False, "rec_backend": "vulkan",
-        "known_issues": ["FP16 atomics unreliable", "8GB VRAM severely limits model size", "Vulkan backend may outperform HIP on this card"],
-        "notes": "Override to gfx1100. Consider Vulkan backend for better perf."
-    },
-    "7483": {
-        "name": "RX 7600 XT", "arch": "RDNA3", "gfx_target": "gfx1102",
-        "override": "11.0.0", "supported": False, "rec_backend": "vulkan",
-        "known_issues": ["FP16 atomics unreliable", "Vulkan backend may outperform HIP on this card"],
-        "notes": "Override to gfx1100. 16GB VRAM is nice for the price."
-    },
-    # ── RDNA 2 ──────────────────────────────────────────────
-    "73af": {
-        "name": "RX 6900 XT", "arch": "RDNA2", "gfx_target": "gfx1030",
-        "override": None, "supported": True, "rec_backend": "hip", "known_issues": [],
-        "notes": "Natively supported. Best RDNA2 card for ROCm."
-    },
-    "73bf": {
-        "name": "RX 6800 XT / 6800", "arch": "RDNA2", "gfx_target": "gfx1030",
-        "override": None, "supported": True, "rec_backend": "hip", "known_issues": [],
-        "notes": "Natively supported."
-    },
-    "73df": {
-        "name": "RX 6700 XT", "arch": "RDNA2", "gfx_target": "gfx1031",
-        "override": "10.3.0", "supported": False, "rec_backend": "vulkan",
-        "known_issues": ["Matrix core operations may be slower than native gfx1030", "Some BLAS operations produce NaN with FP16"],
-        "notes": "Override to gfx1030. 12GB VRAM is decent for 7B-13B models."
-    },
-    "73ff": {
-        "name": "RX 6600 XT / 6600", "arch": "RDNA2", "gfx_target": "gfx1032",
-        "override": "10.3.0", "supported": False, "rec_backend": "vulkan",
-        "known_issues": ["Significantly slower than gfx1030 native cards", "8GB VRAM limits model size", "Vulkan often faster than HIP on this chip"],
-        "notes": "Override to gfx1030. Strongly consider Vulkan backend."
-    },
-    "743f": {
-        "name": "RX 6500 XT", "arch": "RDNA2", "gfx_target": "gfx1034",
-        "override": "10.3.0", "supported": False, "rec_backend": "vulkan",
-        "known_issues": ["4GB VRAM barely usable for LLM inference", "PCIe x4 bus severely limits CPU to GPU transfer"],
-        "notes": "Override to gfx1030. Honestly barely worth it for AI."
-    },
-    # ── INTEGRATED GPUs ─────────────────────────────────────
-    "164e": {
-        "name": "Radeon Graphics (Ryzen 7000 iGPU)", "arch": "RDNA2", "gfx_target": "gfx1036",
-        "override": None, "supported": False, "rec_backend": "cpu",
-        "known_issues": ["Integrated GPU — shares system RAM, no dedicated VRAM", "Not usable for ROCm/HIP inference"],
-        "notes": "Built-in GPU in Ryzen 7000 CPUs. Ignore for AI — use your dedicated GPU."
-    },
-    "1638": {
-        "name": "Radeon Graphics (Ryzen 5000 iGPU)", "arch": "Vega", "gfx_target": "gfx90c",
-        "override": None, "supported": False, "rec_backend": "cpu",
-        "known_issues": ["Integrated GPU — not usable for ROCm inference"],
-        "notes": "Built-in Vega iGPU in Ryzen 5000G APUs. Ignore for AI."
-    },
+FALLBACK_DATABASE = {
+    "7550": {"name": "RX 9070 XT / 9070 / 9070 GRE (Navi 48)", "arch": "RDNA4", "gfx_target": "gfx1201", "override": None, "supported": True, "rec_backend": "vulkan", "known_issues": [], "notes": "Natively supported in ROCm 6.4+."},
+    "7551": {"name": "Radeon AI PRO R9700 (Navi 48 Pro)", "arch": "RDNA4", "gfx_target": "gfx1201", "override": None, "supported": True, "rec_backend": "hip", "known_issues": [], "notes": "Enterprise variant of Navi 48."},
+    "7590": {"name": "RX 9060 XT / 9060 / 9050 (Navi 44)", "arch": "RDNA4", "gfx_target": "gfx1200", "override": "12.0.1", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1201."},
+    "744c": {"name": "RX 7900 XTX", "arch": "RDNA3", "gfx_target": "gfx1100", "override": None, "supported": True, "rec_backend": "hip", "known_issues": [], "notes": "Natively supported."},
+    "744e": {"name": "RX 7900 XT", "arch": "RDNA3", "gfx_target": "gfx1100", "override": None, "supported": True, "rec_backend": "hip", "known_issues": [], "notes": "Natively supported."},
+    "747e": {"name": "RX 7900 GRE / RX 7800 XT (variant)", "arch": "RDNA3", "gfx_target": "gfx1100", "override": None, "supported": True, "rec_backend": "vulkan", "known_issues": [], "notes": "Try override 11.0.0 if HIP fails."},
+    "7470": {"name": "RX 7800 XT", "arch": "RDNA3", "gfx_target": "gfx1101", "override": "11.0.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1100."},
+    "7471": {"name": "RX 7700 XT", "arch": "RDNA3", "gfx_target": "gfx1101", "override": "11.0.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Same override as 7800 XT."},
+    "7480": {"name": "RX 7600", "arch": "RDNA3", "gfx_target": "gfx1102", "override": "11.0.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1100."},
+    "7483": {"name": "RX 7600 XT", "arch": "RDNA3", "gfx_target": "gfx1102", "override": "11.0.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1100."},
+    "73af": {"name": "RX 6900 XT", "arch": "RDNA2", "gfx_target": "gfx1030", "override": None, "supported": True, "rec_backend": "hip", "known_issues": [], "notes": "Natively supported."},
+    "73bf": {"name": "RX 6800 XT / 6800", "arch": "RDNA2", "gfx_target": "gfx1030", "override": None, "supported": True, "rec_backend": "hip", "known_issues": [], "notes": "Natively supported."},
+    "73df": {"name": "RX 6700 XT", "arch": "RDNA2", "gfx_target": "gfx1031", "override": "10.3.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1030."},
+    "73ff": {"name": "RX 6600 XT / 6600", "arch": "RDNA2", "gfx_target": "gfx1032", "override": "10.3.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1030."},
+    "743f": {"name": "RX 6500 XT", "arch": "RDNA2", "gfx_target": "gfx1034", "override": "10.3.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1030."},
+    "164e": {"name": "Radeon Graphics (Ryzen 7000 iGPU)", "arch": "RDNA2", "gfx_target": "gfx1036", "override": None, "supported": False, "rec_backend": "cpu", "known_issues": [], "notes": "iGPU. Ignore for AI."},
+    "1638": {"name": "Radeon Graphics (Ryzen 5000 iGPU)", "arch": "Vega", "gfx_target": "gfx90c", "override": None, "supported": False, "rec_backend": "cpu", "known_issues": [], "notes": "iGPU. Ignore for AI."},
 }
 
+# GPU_DATABASE is populated dynamically at runtime
+GPU_DATABASE = dict(FALLBACK_DATABASE)
+
 # ──────────────────────────────────────────────────────────────────────
-# 2. COLOR / TERMINAL UTILITIES
+# COLOR / TERMINAL
 # ──────────────────────────────────────────────────────────────────────
 
 class C:
-    RESET  = "\033[0m"
-    BOLD   = "\033[1m"
-    RED    = "\033[91m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE   = "\033[94m"
-    CYAN   = "\033[96m"
-    GRAY   = "\033[90m"
+    RESET = "\033[0m"; BOLD = "\033[1m"; RED = "\033[91m"; GREEN = "\033[92m"
+    YELLOW = "\033[93m"; BLUE = "\033[94m"; CYAN = "\033[96m"; GRAY = "\033[90m"
 
 def enable_ansi():
     if platform.system().lower() == "windows":
@@ -169,7 +86,7 @@ def enable_ansi():
             C.RESET = ""
 
 # ──────────────────────────────────────────────────────────────────────
-# 3. CONFIG MANAGEMENT
+# CONFIG
 # ──────────────────────────────────────────────────────────────────────
 
 def _ensure_config_dirs():
@@ -190,6 +107,8 @@ def load_config() -> dict:
         "first_run": True,
         "installed_globally": False,
         "applied_overrides": [],
+        "last_update_check": None,
+        "last_db_sync": None,
     }
 
 def save_config(cfg: dict):
@@ -197,16 +116,110 @@ def save_config(cfg: dict):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 # ──────────────────────────────────────────────────────────────────────
-# 4. DETECTION LOGIC
+# LIVE DB SYNC
+# ──────────────────────────────────────────────────────────────────────
+
+def sync_gpu_database(force: bool = False) -> str:
+    """
+    Fetches gpus.json from Render server, caches locally.
+    Returns: 'fetched', 'cached', 'fallback'
+    """
+    global GPU_DATABASE
+    _ensure_config_dirs()
+    cfg = load_config()
+
+    # Check if cache is still fresh
+    if not force and DB_CACHE_FILE.exists():
+        last_sync_str = cfg.get("last_db_sync")
+        if last_sync_str:
+            try:
+                last = datetime.fromisoformat(last_sync_str)
+                if datetime.now(timezone.utc) - last < timedelta(hours=DB_CACHE_TTL_HOURS):
+                    try:
+                        cached = json.loads(DB_CACHE_FILE.read_text())
+                        GPU_DATABASE = cached.get("gpus", FALLBACK_DATABASE)
+                        return "cached"
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    # Try to fetch fresh
+    try:
+        req = urllib.request.Request(DATABASE_ENDPOINT, headers={"User-Agent": f"ROCmFix/{__version__}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            if "gpus" in data and isinstance(data["gpus"], dict):
+                DB_CACHE_FILE.write_text(json.dumps(data))
+                cfg["last_db_sync"] = datetime.now(timezone.utc).isoformat()
+                save_config(cfg)
+                GPU_DATABASE = data["gpus"]
+                return "fetched"
+    except Exception:
+        pass
+
+    # Fallback: try old cache
+    if DB_CACHE_FILE.exists():
+        try:
+            cached = json.loads(DB_CACHE_FILE.read_text())
+            GPU_DATABASE = cached.get("gpus", FALLBACK_DATABASE)
+            return "cached"
+        except Exception:
+            pass
+
+    GPU_DATABASE = dict(FALLBACK_DATABASE)
+    return "fallback"
+
+# ──────────────────────────────────────────────────────────────────────
+# UPDATE CHECKER
+# ──────────────────────────────────────────────────────────────────────
+
+def _version_tuple(v: str) -> tuple:
+    v = v.lstrip("v")
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except Exception:
+        return (0, 0, 0)
+
+def check_for_updates_silent() -> str | None:
+    """Silently checks GitHub for a new release. Returns latest tag if newer, else None."""
+    cfg = load_config()
+    last_check_str = cfg.get("last_update_check")
+    if last_check_str:
+        try:
+            last = datetime.fromisoformat(last_check_str)
+            if datetime.now(timezone.utc) - last < timedelta(hours=UPDATE_CHECK_TTL_HOURS):
+                return None
+        except Exception:
+            pass
+
+    try:
+        req = urllib.request.Request(UPDATE_CHECK_ENDPOINT, headers={"User-Agent": f"ROCmFix/{__version__}"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            latest = data.get("tag_name", "").lstrip("v")
+            cfg["last_update_check"] = datetime.now(timezone.utc).isoformat()
+            save_config(cfg)
+            if latest and _version_tuple(latest) > _version_tuple(__version__):
+                return latest
+    except Exception:
+        pass
+    return None
+
+# ──────────────────────────────────────────────────────────────────────
+# DETECTION
 # ──────────────────────────────────────────────────────────────────────
 
 def _run(cmd, shell=False):
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=shell, timeout=10)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, shell=shell, timeout=10,
+            encoding="utf-8", errors="replace"
+        )
         return result.stdout
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+    except Exception:
         return ""
-
+    
 def detect_os() -> str:
     system = platform.system().lower()
     if system == "windows": return "windows"
@@ -300,18 +313,17 @@ def detect_rocm_version():
     return None
 
 def analyze_driver(drv_ver: str) -> dict | None:
-    """Analyzes Windows Adrenalin driver versions."""
     if not drv_ver or drv_ver == "unknown": return None
     try:
         major = int(drv_ver.split('.')[0])
         if major >= 32: return {"status": "ok", "msg": "Adrenalin 24.x+ (Good)"}
-        elif major == 31: return {"status": "warn", "msg": "Adrenalin 23.x (Update recommended for ROCm 6)"}
-        else: return {"status": "bad", "msg": f"Very old driver ({major}.x). ROCm/HIP will likely fail."}
+        elif major == 31: return {"status": "warn", "msg": "Adrenalin 23.x (Update recommended)"}
+        else: return {"status": "bad", "msg": f"Very old driver ({major}.x)."}
     except Exception:
         return None
 
 # ──────────────────────────────────────────────────────────────────────
-# 5. SMOKE TESTING
+# SMOKE TEST
 # ──────────────────────────────────────────────────────────────────────
 
 def run_smoke_test(override):
@@ -324,20 +336,19 @@ def run_smoke_test(override):
         try:
             res = subprocess.run(["rocminfo"], capture_output=True, text=True, env=env, timeout=10)
             if res.returncode != 0 or "Agent" not in res.stdout:
-                return {"success": False, "message": "rocminfo failed to find a GPU agent.", "details": (res.stderr or res.stdout)[:300]}
+                return {"success": False, "message": "rocminfo failed.", "details": (res.stderr or res.stdout)[:300]}
             gpu_count = res.stdout.count("Device Type:                     GPU")
             if gpu_count == 0:
-                return {"success": False, "message": "0 GPU agents found.", "details": ""}
+                return {"success": False, "message": "0 GPU agents.", "details": ""}
             return {"success": True, "message": f"ROCm detected {gpu_count} GPU agent(s).", "details": f"override={override or 'not set'}"}
         except FileNotFoundError:
-            return {"success": False, "message": "rocminfo not found. Is ROCm installed?", "details": ""}
+            return {"success": False, "message": "rocminfo not found.", "details": ""}
         except Exception as e:
             return {"success": False, "message": str(e), "details": ""}
-
     elif os_name == "windows":
         hip_path = os.environ.get("HIP_PATH", "")
         if not hip_path:
-            return {"success": False, "message": "HIP_PATH not set. Install the HIP SDK.", "details": "Run 'rocmfix install-hip'"}
+            return {"success": False, "message": "HIP_PATH not set.", "details": "Run 'rocmfix install-hip'"}
         hipinfo = os.path.join(hip_path, "bin", "hipInfo.exe")
         if not os.path.exists(hipinfo):
             return {"success": False, "message": "hipInfo.exe not found.", "details": f"Looked in: {hip_path}\\bin\\"}
@@ -350,11 +361,10 @@ def run_smoke_test(override):
             return {"success": True, "message": "HIP SDK detected your GPU.", "details": f"override={override or 'not set'}"}
         except Exception as e:
             return {"success": False, "message": str(e), "details": ""}
-
     return {"success": False, "message": "Unsupported OS", "details": ""}
 
 # ──────────────────────────────────────────────────────────────────────
-# 6. AUTO-APPLY OVERRIDE
+# AUTO-APPLY
 # ──────────────────────────────────────────────────────────────────────
 
 def _backup_file(path: Path) -> Path:
@@ -406,7 +416,6 @@ def undo_last_override() -> dict:
     cfg = load_config()
     if not cfg["applied_overrides"]: return {"success": False, "error": "No previous overrides to undo."}
     last = cfg["applied_overrides"][-1]
-    
     if detect_os() == "windows":
         try:
             import winreg, ctypes
@@ -435,18 +444,21 @@ def undo_last_override() -> dict:
         return {"success": False, "error": "No backup file found."}
 
 # ──────────────────────────────────────────────────────────────────────
-# 7. TELEMETRY
+# TELEMETRY
 # ──────────────────────────────────────────────────────────────────────
 
-def build_telemetry_payload(gpu: dict, info: dict, rocm_ver, smoke_result=None) -> dict:
+def build_telemetry_payload(gpu: dict, info: dict, rocm_ver, smoke_result=None, benchmark=None) -> dict:
     cfg = load_config()
-    return {
-        "schema_version": 1, "user_id": cfg["user_id"], "rocmfix_version": __version__,
+    payload = {
+        "schema_version": 2, "user_id": cfg["user_id"], "rocmfix_version": __version__,
         "timestamp": datetime.now(timezone.utc).isoformat(), "os": detect_os(), "shell": detect_shell(),
         "gpu": {"name": gpu.get("name"), "pci_id": gpu.get("pci_id"), "driver_version": gpu.get("driver_version")},
         "database": {"in_database": info is not None, "override_recommended": info.get("override") if info else None, "supported_native": info.get("supported") if info else None},
         "rocm_version": rocm_ver, "smoke_test": smoke_result if smoke_result else None
     }
+    if benchmark:
+        payload["benchmark"] = benchmark
+    return payload
 
 def _queue_payload(payload: dict):
     _ensure_config_dirs()
@@ -466,8 +478,7 @@ def flush_outbox():
     for file in sorted(OUTBOX_DIR.glob("*.json")):
         try:
             if _send_payload(json.loads(file.read_text())):
-                file.unlink()
-                sent += 1
+                file.unlink(); sent += 1
             else: failed += 1
         except (json.JSONDecodeError, OSError): file.unlink()
     return sent, failed
@@ -490,17 +501,12 @@ def show_telemetry_sample(gpu, info, rocm_ver):
 def prompt_telemetry_optin() -> bool:
     print(f"\n{C.BOLD}{C.CYAN}📊 Help improve ROCmFix?{C.RESET}\n")
     print("  ROCmFix can anonymously share your GPU detection results")
-    print("  with the community database. This helps:")
-    print(f"    {C.GREEN}•{C.RESET} Add new GPUs to the database faster")
-    print(f"    {C.GREEN}•{C.RESET} Detect driver bugs and regressions")
-    print(f"    {C.GREEN}•{C.RESET} Improve override recommendations\n")
-    print(f"  {C.BOLD}What gets sent:{C.RESET} GPU model, PCI ID, driver, OS, override value")
+    print("  and benchmarks with the community database.\n")
+    print(f"  {C.BOLD}What gets sent:{C.RESET} GPU model, PCI ID, driver, OS, override, bench results")
     print(f"  {C.BOLD}What does NOT get sent:{C.RESET} Username, IP, file paths, personal data\n")
-    print(f"  {C.GRAY}Data goes to a private server. See github.com/{GITHUB_REPO}/blob/main/PRIVACY.md{C.RESET}\n")
     print(f"    [{C.GREEN}Y{C.RESET}] Yes, share anonymous data")
     print(f"    [{C.RED}N{C.RESET}] No, keep everything local")
     print(f"    [{C.CYAN}?{C.RESET}] Show me exactly what gets sent\n")
-
     while True:
         try: ans = input("  > ").strip().lower()
         except (EOFError, KeyboardInterrupt): return False
@@ -512,7 +518,7 @@ def prompt_telemetry_optin() -> bool:
             print(f"    [{C.GREEN}Y{C.RESET}] Yes  [{C.RED}N{C.RESET}] No")
 
 # ──────────────────────────────────────────────────────────────────────
-# 8. GLOBAL INSTALLER & HELPERS
+# GLOBAL INSTALLER & HELPERS
 # ──────────────────────────────────────────────────────────────────────
 
 def is_installed_globally() -> bool: return shutil.which("rocmfix") is not None
@@ -520,11 +526,9 @@ def is_installed_globally() -> bool: return shutil.which("rocmfix") is not None
 def install_globally() -> bool:
     os_name, script_path, script_dir = detect_os(), Path(__file__).resolve(), Path(__file__).resolve().parent
     print(f"\n{C.BOLD}{C.CYAN}⚙️  Register 'rocmfix' as a global command?{C.RESET}")
-    print("  This lets you run 'rocmfix' from any folder.\n")
     try:
         if input("  Install globally? [Y/n]: ").strip().lower() == 'n': return False
     except: return False
-
     if os_name == "windows":
         try:
             (script_dir / "rocmfix.bat").write_text(f'@echo off\npython "{script_path}" %*\n')
@@ -536,9 +540,9 @@ def install_globally() -> bool:
                 winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, f"{path_val};{script_dir}" if path_val else str(script_dir))
                 ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x001A, 0, "Environment", 2, 5000, ctypes.byref(ctypes.c_long()))
             winreg.CloseKey(key)
-            print(f"\n  {C.GREEN}✓ Registered! Open a NEW terminal and run: rocmfix{C.RESET}\n")
+            print(f"\n  {C.GREEN}✓ Registered!{C.RESET}\n")
             return True
-        except Exception as e: print(f"{C.RED}Registry write failed: {e}{C.RESET}"); return False
+        except Exception as e: print(f"{C.RED}Failed: {e}{C.RESET}"); return False
     else:
         try:
             local_bin = Path.home() / ".local" / "bin"
@@ -547,9 +551,8 @@ def install_globally() -> bool:
             shutil.copy2(script_path, dest)
             dest.chmod(0o755)
             print(f"\n  {C.GREEN}✓ Installed to {dest}{C.RESET}")
-            if str(local_bin) not in os.environ.get("PATH", ""): print(f"  {C.YELLOW}⚠ Add to PATH: export PATH=\"$HOME/.local/bin:$PATH\"{C.RESET}\n")
             return True
-        except Exception as e: print(f"{C.RED}Copy failed: {e}{C.RESET}"); return False
+        except Exception as e: print(f"{C.RED}Failed: {e}{C.RESET}"); return False
 
 def format_env_command(override: str) -> str:
     shell = detect_shell()
@@ -558,8 +561,8 @@ def format_env_command(override: str) -> str:
     return f"  set -gx HSA_OVERRIDE_GFX_VERSION {override}" if shell == "fish" else f"  export HSA_OVERRIDE_GFX_VERSION={override}"
 
 def get_issue_url(gpu, rocm_ver):
-    body = f"## Unknown GPU\n\n- **Name:** {gpu.get('name')}\n- **PCI ID:** `{gpu.get('pci_id')}`\n- **Driver:** {gpu.get('driver_version')}\n- **ROCm:** {rocm_ver or 'not detected'}\n- **OS:** {detect_os()}\n"
-    params = urllib.parse.urlencode({"title": f"[GPU Report] Unknown AMD GPU: {gpu.get('name','?')} ({gpu.get('pci_id','?')})", "body": body, "labels": "unknown-gpu"})
+    body = f"## Unknown GPU\n\n- **Name:** {gpu.get('name')}\n- **PCI ID:** `{gpu.get('pci_id')}`\n- **Driver:** {gpu.get('driver_version')}\n- **OS:** {detect_os()}\n"
+    params = urllib.parse.urlencode({"title": f"[GPU Report] {gpu.get('name','?')} ({gpu.get('pci_id','?')})", "body": body, "labels": "unknown-gpu"})
     return f"https://github.com/{GITHUB_REPO}/issues/new?{params}"
 
 def print_header():
@@ -568,13 +571,326 @@ def print_header():
     print(f"  ║   AMD GPU override helper for ROCm   ║")
     print(f"  ╚══════════════════════════════════════╝\n{C.RESET}")
 
+def maybe_print_update_banner():
+    latest = check_for_updates_silent()
+    if latest:
+        print(f"  {C.YELLOW}[!] Update available: v{latest} (you have v{__version__}){C.RESET}")
+        print(f"  {C.YELLOW}    Run 'rocmfix update' to install.{C.RESET}\n")
+
 # ──────────────────────────────────────────────────────────────────────
-# 9. CLI COMMANDS
+# BENCH HELPERS
+# ──────────────────────────────────────────────────────────────────────
+
+def find_lm_studio_models() -> list[str]:
+    """Scan LM Studio's model directory."""
+    home = Path.home()
+    candidates = [
+        home / ".cache" / "lm-studio" / "models",
+        home / ".lmstudio" / "models",
+        home / "AppData" / "Roaming" / "LMStudio" / "models",
+    ]
+    models = []
+    for base in candidates:
+        if base.exists():
+            for gguf in base.rglob("*.gguf"):
+                models.append(str(gguf))
+    return models
+
+def bench_via_ollama(gpu_override: str | None) -> dict:
+    """Run Vulkan vs HIP bench through Ollama. Returns dict with results."""
+    if "ollama version" not in _run(["ollama", "--version"]):
+        return {"error": "ollama not found"}
+
+    models_out = _run(["ollama", "list"])
+    models = [line.split()[0] for line in models_out.splitlines()[1:] if line.strip()]
+    if not models:
+        print(f"  {C.YELLOW}Pulling qwen2.5:0.5b (~400MB)...{C.RESET}")
+        subprocess.run(["ollama", "pull", "qwen2.5:0.5b"])
+        models = ["qwen2.5:0.5b"]
+
+    model = models[0]
+    prompt = "Write a 50 word story about a robot learning to paint."
+    print(f"  Model: {model}\n")
+    results = {"runtime": "ollama", "model": model, "vulkan_toks": 0, "hip_toks": 0}
+
+    for backend in ["vulkan", "rocm"]:
+        print(f"  Testing {C.BOLD}{backend.upper()}{C.RESET}...")
+        if detect_os() == "windows":
+            _run(["taskkill", "/F", "/IM", "ollama_app.exe"])
+            _run(["taskkill", "/F", "/IM", "ollama.exe"])
+        else:
+            _run(["pkill", "-9", "ollama"])
+        time.sleep(1)
+
+        env = os.environ.copy()
+        env["OLLAMA_GPU_BACKEND"] = backend
+        if gpu_override:
+            env["HSA_OVERRIDE_GFX_VERSION"] = gpu_override
+
+        proc = subprocess.Popen(["ollama", "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(4)
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:11434/api/generate",
+                data=json.dumps({"model": model, "prompt": prompt, "stream": False}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read())
+                tok_s = round(data.get("eval_count", 0) / (data.get("eval_duration", 1) / 1e9), 2)
+                results[f"{'vulkan' if backend=='vulkan' else 'hip'}_toks"] = tok_s
+                print(f"    {C.GREEN}→ {tok_s} tok/s{C.RESET}")
+        except Exception as e:
+            print(f"    {C.RED}→ Failed: {e}{C.RESET}")
+        try: proc.kill()
+        except: pass
+
+    vk, hp = results["vulkan_toks"], results["hip_toks"]
+    results["winner"] = "vulkan" if vk > hp else "hip" if hp > vk else "tie"
+    return results
+
+def bench_via_lmstudio(gpu_override: str | None) -> dict:
+    """LM Studio bench: start server, load model, wait until ready, then chat."""
+    lms_out = _run(["lms", "version"])
+    if not lms_out.strip():
+        if not _run(["lms", "--help"]).strip() and shutil.which("lms") is None:
+            return {"error": "LM Studio CLI (lms) not found. Open LM Studio → install CLI / run 'lms bootstrap'."}
+
+    model_id = None
+    model_name = None
+
+    ls_out = _run(["lms", "ls"])
+    if not ls_out.strip():
+        ls_out = _run(["lms", "ls", "--json"])
+
+    for line in ls_out.splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("you have") or "params" in line.lower():
+            continue
+        parts = line.split()
+        if parts:
+            candidate = parts[0]
+            if candidate.lower() in ("identifier", "model", "name", "---", "path"):
+                continue
+            model_id = candidate
+            model_name = candidate
+            break
+
+    if not model_id:
+        models = find_lm_studio_models()
+        if not models:
+            return {"error": "No LM Studio models found. Download a GGUF in LM Studio first."}
+        model_id = models[0]
+        model_name = Path(models[0]).stem
+
+    print(f"  Model: {model_name}\n")
+    results = {
+        "runtime": "lm_studio",
+        "model": model_name,
+        "vulkan_toks": 0.0,
+        "hip_toks": 0.0,
+        "winner": "tie",
+    }
+
+    prompt_payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "Write a 40 word story about a robot learning to paint."}],
+        "max_tokens": 64,
+        "stream": False,
+        "temperature": 0.2,
+    }
+
+    def _lms_api(method: str, path: str, body: dict | None = None, timeout: int = 180):
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:1234{path}",
+            data=data,
+            method=method,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer lm-studio",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw else {}
+
+    def _wait_model_loaded(want: str, seconds: int = 90) -> bool:
+        deadline = time.time() + seconds
+        want_l = want.lower()
+        while time.time() < deadline:
+            try:
+                data = _lms_api("GET", "/v1/models", None, timeout=10)
+                items = data.get("data") or []
+                if not items:
+                    time.sleep(1.5)
+                    continue
+                for it in items:
+                    mid = str(it.get("id", "")).lower()
+                    if want_l in mid or mid in want_l or Path(want).stem.lower() in mid:
+                        return True
+                return True
+            except Exception:
+                time.sleep(1.5)
+        return False
+
+    def _unload_all(env: dict | None = None):
+        """Best-effort unload so VRAM is free before next backend / exit."""
+        e = env or os.environ.copy()
+        cmds = [
+            ["lms", "unload", "--all"],
+            ["lms", "unload", "-a"],
+            ["lms", "unload"],
+        ]
+        if model_id:
+            cmds.insert(0, ["lms", "unload", str(model_id)])
+            cmds.insert(1, ["lms", "unload", model_name])
+        for cmd in cmds:
+            try:
+                subprocess.run(
+                    cmd,
+                    env=e,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                )
+            except Exception:
+                continue
+        time.sleep(2)
+
+    def _ensure_server(env: dict):
+        _run(["lms", "server", "stop"])
+        time.sleep(1)
+        try:
+            subprocess.Popen(
+                ["lms", "server", "start"],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=0x08000000 if detect_os() == "windows" else 0,
+            )
+        except Exception:
+            subprocess.Popen(["lms", "server", "start"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(30):
+            try:
+                _lms_api("GET", "/v1/models", None, timeout=3)
+                return True
+            except Exception:
+                time.sleep(1)
+        return False
+
+    def _load_model(env: dict) -> bool:
+        load_cmds = [
+            ["lms", "load", model_id],
+            ["lms", "load", model_id, "-y"],
+            ["lms", "load", str(model_id)],
+        ]
+        for cmd in load_cmds:
+            try:
+                subprocess.run(
+                    cmd,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=180,
+                )
+            except Exception:
+                continue
+            if _wait_model_loaded(str(model_id), seconds=60):
+                return True
+        return False
+
+    for backend in ["vulkan", "rocm"]:
+        print(f"  Testing {C.BOLD}{backend.upper()}{C.RESET}...")
+        env = os.environ.copy()
+        env["OLLAMA_GPU_BACKEND"] = backend
+        if backend == "vulkan":
+            env["GGML_VK_VISIBLE_DEVICES"] = "0"
+        if gpu_override:
+            env["HSA_OVERRIDE_GFX_VERSION"] = gpu_override
+
+        print(f"    {C.GRAY}Unloading any previous model...{C.RESET}")
+        _unload_all(env)
+
+        if not _ensure_server(env):
+            print(f"    {C.RED}→ Server failed to start{C.RESET}")
+            continue
+
+        print(f"    {C.GRAY}Loading model (this can take a minute)...{C.RESET}")
+        if not _load_model(env):
+            print(f"    {C.RED}→ Could not load model via 'lms load'{C.RESET}")
+            print(f"    {C.YELLOW}Tip: In LM Studio Developer tab, load the model once, keep server on, retry.{C.RESET}")
+            continue
+
+        chat_model = model_name
+        try:
+            listed = _lms_api("GET", "/v1/models")
+            ids = [x.get("id") for x in (listed.get("data") or []) if x.get("id")]
+            if ids:
+                stem = Path(str(model_id)).stem.lower()
+                pick = None
+                for i in ids:
+                    if stem in str(i).lower() or str(i).lower() in stem:
+                        pick = i
+                        break
+                chat_model = pick or ids[0]
+                prompt_payload["model"] = chat_model
+        except Exception:
+            prompt_payload["model"] = chat_model
+
+        try:
+            start = time.time()
+            data = _lms_api("POST", "/v1/chat/completions", prompt_payload, timeout=300)
+            elapsed = max(time.time() - start, 0.001)
+            usage = data.get("usage") or {}
+            completion_tokens = usage.get("completion_tokens") or usage.get("total_tokens") or 0
+            if not completion_tokens:
+                content = ""
+                try: content = data["choices"][0]["message"]["content"]
+                except Exception: content = ""
+                completion_tokens = max(len(content.split()), 1)
+            tok_s = round(completion_tokens / elapsed, 2)
+            key = "vulkan_toks" if backend == "vulkan" else "hip_toks"
+            results[key] = tok_s
+            print(f"    {C.GREEN}→ {tok_s} tok/s{C.RESET}")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+            print(f"    {C.RED}→ HTTP {e.code}: {body[:180] or e.reason}{C.RESET}")
+        except Exception as e:
+            print(f"    {C.RED}→ Failed: {e}{C.RESET}")
+
+        print(f"    {C.GRAY}Unloading model...{C.RESET}")
+        _unload_all(env)
+
+    print(f"  {C.GRAY}Final cleanup...{C.RESET}")
+    _unload_all()
+
+    try: _run(["lms", "server", "stop"])
+    except Exception: pass
+
+    vk, hp = results["vulkan_toks"], results["hip_toks"]
+    results["winner"] = "vulkan" if vk > hp else "hip" if hp > vk else "tie"
+    return results
+
+# ──────────────────────────────────────────────────────────────────────
+# CLI COMMANDS
 # ──────────────────────────────────────────────────────────────────────
 
 def cmd_detect(args):
     print_header()
     cfg = load_config()
+
+    sync_result = sync_gpu_database()
+    if sync_result == "fetched":
+        print(f"  {C.GRAY}[DB synced from server ({len(GPU_DATABASE)} GPUs)]{C.RESET}")
+    elif sync_result == "cached":
+        print(f"  {C.GRAY}[Using cached DB ({len(GPU_DATABASE)} GPUs)]{C.RESET}")
+
+    maybe_print_update_banner()
+
     if cfg.get("first_run") and not is_installed_globally():
         if install_globally(): cfg["installed_globally"] = True
     if cfg.get("telemetry_enabled") is None:
@@ -601,7 +917,6 @@ def cmd_detect(args):
     for i, gpu in enumerate(gpus, 1):
         print(f"\n  [{i}] {C.BOLD}{gpu['name']}{C.RESET}")
         print(f"      PCI ID:  {gpu['pci_id']}\n      Driver:  {gpu['driver_version']}")
-
         info = GPU_DATABASE.get(gpu["pci_id"])
         if cfg["telemetry_enabled"]: send_telemetry(build_telemetry_payload(gpu, info, rocm_ver))
 
@@ -620,15 +935,14 @@ def cmd_detect(args):
 
         print(f"      Status:  {C.YELLOW}Needs override{C.RESET}")
         print(f"      gfx target: {info['gfx_target']} → override {info['override']}")
-        if info["known_issues"]:
+        if info.get("known_issues"):
             print(f"      {C.RED}Known issues:{C.RESET}")
             for issue in info["known_issues"]: print(f"        - {issue}")
 
         print(f"\n      {C.BOLD}Apply this override?{C.RESET}")
-        print(f"        [{C.GREEN}A{C.RESET}] Apply automatically (modifies your shell config)")
-        print(f"        [{C.CYAN}S{C.RESET}] Show me the command to paste manually")
+        print(f"        [{C.GREEN}A{C.RESET}] Apply automatically")
+        print(f"        [{C.CYAN}S{C.RESET}] Show me the command")
         print(f"        [{C.GRAY}N{C.RESET}] Skip")
-
         try: choice = input("      > ").strip().lower()
         except: choice = "n"
 
@@ -638,16 +952,16 @@ def cmd_detect(args):
                 print(f"\n      {C.GREEN}✓ Override applied!{C.RESET}")
                 print(f"      {C.YELLOW}⚠ Open a NEW terminal for it to take effect.{C.RESET}")
             else:
-                print(f"\n      {C.RED}✗ Failed: {res.get('error')}{C.RESET}\n      Fall back to manual command:\n{format_env_command(info['override'])}")
+                print(f"\n      {C.RED}✗ Failed: {res.get('error')}{C.RESET}\n{format_env_command(info['override'])}")
         elif choice == "s":
-            print(f"\n      {C.BOLD}Run this in your {shell}:{C.RESET}\n{format_env_command(info['override'])}")
+            print(f"\n      {C.BOLD}Run in {shell}:{C.RESET}\n{format_env_command(info['override'])}")
         else: print(f"      {C.GRAY}Skipped.{C.RESET}")
 
 def cmd_doctor(args):
     print_header()
+    sync_gpu_database()
     print(f"{C.BOLD}{C.CYAN}🩺 ROCmFix System Doctor{C.RESET}\n")
     gpus = detect_gpus()
-    
     print(f"{C.BOLD}1. Hardware & Drivers{C.RESET}")
     if not gpus: print(f"  {C.RED}✗ No AMD GPUs detected{C.RESET}")
     for g in gpus:
@@ -658,36 +972,31 @@ def cmd_doctor(args):
             icon = "✓" if drv_eval["status"]=="ok" else "⚠" if drv_eval["status"]=="warn" else "✗"
             print(f"  {color}{icon} Driver:{C.RESET} {g['driver_version']} — {drv_eval['msg']}")
         else: print(f"  {C.GRAY}• Driver:{C.RESET} {g['driver_version']}")
-
     print(f"\n{C.BOLD}2. ROCm / HIP Engine{C.RESET}")
     if detect_os() == "windows":
         hip = os.environ.get("HIP_PATH")
         if hip and Path(hip).exists(): print(f"  {C.GREEN}✓ HIP SDK Installed:{C.RESET} {hip}")
         else:
             print(f"  {C.RED}✗ HIP SDK MISSING{C.RESET}")
-            print(f"    {C.GRAY}AI programs will fall back to CPU or Vulkan.{C.RESET}")
-            print(f"    {C.CYAN}Run: rocmfix install-hip{C.RESET} to install it automatically.")
+            print(f"    {C.CYAN}Run: rocmfix install-hip{C.RESET}")
     else:
         rocm = detect_rocm_version()
         if rocm: print(f"  {C.GREEN}✓ ROCm Installed:{C.RESET} v{rocm}")
         else: print(f"  {C.RED}✗ ROCm NOT FOUND{C.RESET}")
-
     print(f"\n{C.BOLD}3. Vulkan Engine{C.RESET}")
     vk = _run(["vulkaninfo", "--summary"])
     if "Vulkan Instance Version" in vk or "devices" in vk.lower(): print(f"  {C.GREEN}✓ Vulkan API ready{C.RESET}")
-    else: print(f"  {C.YELLOW}⚠ Vulkan not responding (vulkaninfo failed){C.RESET}")
-
+    else: print(f"  {C.YELLOW}⚠ Vulkan not responding{C.RESET}")
     print(f"\n{C.BOLD}4. Environment Override{C.RESET}")
     ov = os.environ.get("HSA_OVERRIDE_GFX_VERSION")
     if ov: print(f"  {C.GREEN}✓ Set to:{C.RESET} {ov}")
-    else: print(f"  {C.GRAY}• Not currently set in this session.{C.RESET}")
-
+    else: print(f"  {C.GRAY}• Not currently set.{C.RESET}")
     print(f"\n{C.BOLD}Recommendation:{C.RESET}")
     for g in gpus:
         info = GPU_DATABASE.get(g["pci_id"])
         if info:
-            print(f"  For {g['name']}: Use {C.BOLD}{info['rec_backend'].upper()}{C.RESET} backend.")
-            if info['override']: print(f"  Requires HSA_OVERRIDE_GFX_VERSION={info['override']} for HIP.")
+            print(f"  For {g['name']}: Use {C.BOLD}{info.get('rec_backend','vulkan').upper()}{C.RESET} backend.")
+            if info.get('override'): print(f"  Requires HSA_OVERRIDE_GFX_VERSION={info['override']} for HIP.")
     print()
 
 def cmd_install_hip(args):
@@ -696,38 +1005,23 @@ def cmd_install_hip(args):
         print(f"  {C.RED}This command is only for Windows.{C.RESET}")
         return
     print(f"{C.BOLD}{C.CYAN}📥 Windows HIP SDK Auto-Installer{C.RESET}\n")
-    
     if os.environ.get("HIP_PATH"):
-        print(f"  {C.GREEN}✓ HIP SDK is already installed at {os.environ.get('HIP_PATH')}{C.RESET}")
+        print(f"  {C.GREEN}✓ HIP SDK already installed at {os.environ.get('HIP_PATH')}{C.RESET}")
         return
-    
-    # List candidate AMD direct links
     candidates = [
         "https://download.amd.com/developer/eula/rocm-hub/HIP-SDK-Inst-Win-v6.1.2.exe",
         "https://download.amd.com/developer/eula/rocm-hub/HIP-SDK-Inst-Win-v6.1.0.exe",
         "https://download.amd.com/developer/eula/rocm-hub/HIP-SDK-Inst-Win-v6.2.0.exe",
     ]
-    official_hub_page = "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
+    hub = "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
     installer_path = Path(os.environ.get("TEMP", ".")) / "HIP-SDK-Installer.exe"
-
-    print("  This will download the official AMD HIP SDK (~1.2 GB).")
-    print("  It provides full ROCm/PyTorch capability on Windows.\n")
-    
+    print("  This will download the official AMD HIP SDK (~1.2 GB).\n")
     try:
-        ans = input("  Proceed with download? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return
-    if ans == 'n': return
-
-    print(f"\n  {C.GRAY}Connecting to AMD servers...{C.RESET}")
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://www.amd.com/",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-    }
-
-    download_success = False
+        if input("  Proceed with download? [Y/n]: ").strip().lower() == 'n': return
+    except: return
+    print(f"\n  {C.GRAY}Connecting to AMD...{C.RESET}")
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Referer": "https://www.amd.com/", "Accept": "*/*"}
+    ok = False
     for url in candidates:
         try:
             req = urllib.request.Request(url, headers=headers)
@@ -741,104 +1035,227 @@ def cmd_install_hip(args):
                         pct = int((downloaded / total) * 100)
                         sys.stdout.write(f"\r  Downloading: [{('='*(pct//2)).ljust(50)}] {pct}% ({downloaded//1024//1024} MB)")
                         sys.stdout.flush()
-            download_success = True
+            ok = True
             print(f"\n\n  {C.GREEN}✓ Download complete!{C.RESET}")
             break
         except Exception:
             continue
-
-    if download_success:
-        print(f"  {C.CYAN}Launching AMD Installer GUI... Please follow the prompts to install.{C.RESET}")
+    if ok:
         try:
             os.startfile(installer_path)
-            print(f"\n  {C.YELLOW}⚠ IMPORTANT: After the AMD installer finishes, RESTART YOUR PC.{C.RESET}\n")
+            print(f"  {C.YELLOW}⚠ After installer finishes, RESTART YOUR PC.{C.RESET}\n")
         except Exception as e:
-            print(f"  {C.RED}Failed to launch installer automatically: {e}{C.RESET}")
+            print(f"  {C.RED}Failed to launch: {e}{C.RESET}")
     else:
-        print(f"\n  {C.YELLOW}⚠ Direct CDN download was blocked or updated by AMD.{C.RESET}")
-        print(f"  {C.CYAN}Opening the official AMD HIP SDK download page in your browser...{C.RESET}\n")
-        try:
-            webbrowser.open(official_hub_page)
-            print(f"  {C.GREEN}✓ Web browser opened.{C.RESET} Download the installer from AMD and run it.")
-            print(f"  Direct Link: {official_hub_page}\n")
-        except Exception as e:
-            print(f"  Manual Download URL: {official_hub_page}\n")
+        print(f"\n  {C.YELLOW}⚠ AMD blocked direct download. Opening browser...{C.RESET}\n")
+        try: webbrowser.open(hub)
+        except: pass
+        print(f"  URL: {hub}\n")
 
 def cmd_bench(args):
     print_header()
-    print(f"{C.BOLD}{C.CYAN}🏎️  Vulkan vs HIP Quick Benchmark (via Ollama){C.RESET}\n")
-    
-    ollama_check = _run(["ollama", "--version"])
-    if "ollama version" not in ollama_check:
-        print(f"  {C.RED}✗ Ollama not found in PATH.{C.RESET}")
-        print("  This 10-second benchmark requires Ollama. Install it from https://ollama.com")
+    sync_gpu_database()
+    print(f"{C.BOLD}{C.CYAN}🏎️  Backend Benchmarker{C.RESET}\n")
+
+    has_ollama = "ollama version" in _run(["ollama", "--version"])
+    has_lms = bool(_run(["lms", "version"]))
+    lms_models = find_lm_studio_models()
+
+    print(f"{C.BOLD}Detected AI runtimes:{C.RESET}")
+    if has_ollama: print(f"  {C.GREEN}✓ Ollama{C.RESET}")
+    else: print(f"  {C.GRAY}✗ Ollama (not installed){C.RESET}")
+    if has_lms and lms_models: print(f"  {C.GREEN}✓ LM Studio{C.RESET} ({len(lms_models)} models)")
+    else: print(f"  {C.GRAY}✗ LM Studio (not installed or no models){C.RESET}")
+
+    if not has_ollama and not (has_lms and lms_models):
+        print(f"\n  {C.RED}No usable runtime found.{C.RESET}")
+        print("  Install Ollama (https://ollama.com) or LM Studio (https://lmstudio.ai)")
         return
 
-    models_out = _run(["ollama", "list"])
-    models = [line.split()[0] for line in models_out.splitlines()[1:] if line.strip()]
-    if not models:
-        print(f"  {C.YELLOW}No models found in Ollama. Pulling 'qwen2.5:0.5b' (~400MB) for testing...{C.RESET}")
-        subprocess.run(["ollama", "pull", "qwen2.5:0.5b"])
-        models = ["qwen2.5:0.5b"]
-    
-    model = models[0]
-    prompt = "Write a 50 word story about a robot learning to paint."
-    print(f"  {C.GRAY}Using model: {model}{C.RESET}")
-    print(f"  {C.GRAY}Testing prompt generation speed...{C.RESET}\n")
+    options = []
+    if has_ollama: options.append(("ollama", "Ollama"))
+    if has_lms and lms_models: options.append(("lm_studio", "LM Studio"))
 
-    results = {}
-    for backend in ["vulkan", "rocm"]:
-        print(f"  Testing {C.BOLD}{backend.upper()}{C.RESET} backend...")
-        print(f"    {C.GRAY}(Restarting local Ollama server to force {backend}...){C.RESET}")
-        if detect_os() == "windows":
-            _run(["taskkill", "/F", "/IM", "ollama_app.exe"])
-            _run(["taskkill", "/F", "/IM", "ollama.exe"])
-        else:
-            _run(["pkill", "-9", "ollama"])
-            
-        time.sleep(1)
-        
-        env = os.environ.copy()
-        env["OLLAMA_GPU_BACKEND"] = backend
-        gpus = detect_gpus()
-        if gpus and GPU_DATABASE.get(gpus[0]["pci_id"], {}).get("override"):
-            env["HSA_OVERRIDE_GFX_VERSION"] = GPU_DATABASE[gpus[0]["pci_id"]]["override"]
-
-        server_proc = subprocess.Popen(["ollama", "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(4) # Wait for server boot
-
-        try:
-            req = urllib.request.Request("http://127.0.0.1:11434/api/generate", 
-                data=json.dumps({"model": model, "prompt": prompt, "stream": False}).encode(),
-                headers={"Content-Type": "application/json"})
-            start = time.time()
-            with urllib.request.urlopen(req) as resp:
-                data = json.loads(resp.read())
-                tok_s = data.get("eval_count", 0) / (data.get("eval_duration", 1) / 1e9)
-                results[backend] = round(tok_s, 2)
-                print(f"    {C.GREEN}→ {results[backend]} tokens/sec{C.RESET}")
-        except Exception as e:
-            print(f"    {C.RED}→ Failed to run: {e}{C.RESET}")
-            results[backend] = 0
-
-        server_proc.kill()
-
-    print(f"\n{C.BOLD}🏆 Benchmark Results:{C.RESET}")
-    vk = results.get("vulkan", 0)
-    rocm = results.get("rocm", 0)
-    print(f"  Vulkan: {vk} tok/s")
-    print(f"  HIP/ROCm: {rocm} tok/s")
-    
-    if vk > rocm and vk > 0:
-        print(f"\n  {C.GREEN}Winner: VULKAN (+{int((vk/rocm - 1)*100 if rocm else 0)}%){C.RESET}")
-        print("  Set OLLAMA_GPU_BACKEND=vulkan in your environment variables for best speed.")
-    elif rocm > vk and rocm > 0:
-        print(f"\n  {C.GREEN}Winner: HIP/ROCm (+{int((rocm/vk - 1)*100 if vk else 0)}%){C.RESET}")
+    if len(options) == 1:
+        choice = options[0][0]
+        print(f"\n  Using {options[0][1]}")
     else:
-        print(f"\n  {C.YELLOW}Could not determine a clear winner.{C.RESET}")
+        print(f"\n  Which runtime?")
+        for i, (_, name) in enumerate(options, 1):
+            print(f"    [{i}] {name}")
+        try:
+            sel = input("  > ").strip()
+            choice = options[int(sel)-1][0]
+        except: return
+
+    gpus = detect_gpus()
+    gpu_override = None
+    target_gpu = None
+    for g in gpus:
+        info = GPU_DATABASE.get(g["pci_id"])
+        if info and info.get("override"):
+            gpu_override = info["override"]
+            target_gpu = g
+            break
+    if not target_gpu and gpus:
+        target_gpu = gpus[0]
+
+    if choice == "ollama":
+        results = bench_via_ollama(gpu_override)
+    else:
+        results = bench_via_lmstudio(gpu_override)
+
+    if "error" in results:
+        print(f"\n  {C.RED}✗ {results['error']}{C.RESET}")
+        return
+
+    vk, hp = results["vulkan_toks"], results["hip_toks"]
+    print(f"\n{C.BOLD}🏆 Results:{C.RESET}")
+    print(f"  Vulkan: {vk} tok/s")
+    print(f"  HIP/ROCm: {hp} tok/s")
+    if vk > hp and vk > 0:
+        print(f"\n  {C.GREEN}Winner: VULKAN (+{int((vk/hp-1)*100 if hp else 0)}%){C.RESET}")
+    elif hp > vk and hp > 0:
+        print(f"\n  {C.GREEN}Winner: HIP/ROCm (+{int((hp/vk-1)*100 if vk else 0)}%){C.RESET}")
+    else:
+        print(f"\n  {C.YELLOW}No clear winner.{C.RESET}")
+
+    cfg = load_config()
+    if cfg.get("telemetry_enabled") and target_gpu:
+        print(f"\n  {C.GRAY}Sending anonymous benchmark to community DB...{C.RESET}")
+        info = GPU_DATABASE.get(target_gpu["pci_id"])
+        payload = build_telemetry_payload(target_gpu, info, detect_rocm_version(), benchmark=results)
+        send_telemetry(payload)
+        print(f"  {C.GREEN}✓ Sent!{C.RESET}")
+
+def cmd_update(args):
+    print_header()
+    print(f"  {C.BOLD}Checking for updates...{C.RESET}")
+    try:
+        req = urllib.request.Request(UPDATE_CHECK_ENDPOINT, headers={"User-Agent": f"ROCmFix/{__version__}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            latest = data.get("tag_name", "").lstrip("v")
+    except Exception as e:
+        print(f"  {C.RED}✗ Failed to reach GitHub: {e}{C.RESET}")
+        return
+
+    print(f"  Current: v{__version__}")
+    print(f"  Latest:  v{latest}\n")
+
+    if _version_tuple(latest) <= _version_tuple(__version__):
+        print(f"  {C.GREEN}✓ You are on the latest version!{C.RESET}")
+        return
+
+    print(f"  {C.YELLOW}Update available!{C.RESET}")
+    try:
+        if input("  Download and install? [Y/n]: ").strip().lower() == 'n': return
+    except: return
+
+    script_path = Path(__file__).resolve()
+    backup_path = BACKUP_DIR / f"rocmfix.py.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
+    _ensure_config_dirs()
+
+    print(f"\n  {C.GRAY}Backing up current version...{C.RESET}")
+    shutil.copy2(script_path, backup_path)
+    print(f"  {C.GRAY}Backup: {backup_path}{C.RESET}")
+
+    print(f"  {C.GRAY}Downloading v{latest}...{C.RESET}")
+    try:
+        req = urllib.request.Request(UPDATE_DOWNLOAD_URL, headers={"User-Agent": f"ROCmFix/{__version__}"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            new_content = resp.read().decode("utf-8")
+    except Exception as e:
+        print(f"  {C.RED}✗ Download failed: {e}{C.RESET}")
+        return
+
+    if detect_os() == "windows":
+        new_path = script_path.with_suffix(".py.new")
+        new_path.write_text(new_content, encoding="utf-8")
+        swap_bat = script_path.parent / "_rocmfix_swap.bat"
+        swap_bat.write_text(
+            f'@echo off\n'
+            f'timeout /t 2 /nobreak >nul\n'
+            f'move /y "{new_path}" "{script_path}"\n'
+            f'del "%~f0"\n'
+        )
+        subprocess.Popen([str(swap_bat)], shell=True, creationflags=0x08000000)
+        print(f"\n  {C.GREEN}✓ Updated to v{latest}!{C.RESET}")
+        print(f"  {C.YELLOW}⚠ Restart your terminal to use the new version.{C.RESET}\n")
+    else:
+        script_path.write_text(new_content, encoding="utf-8")
+        print(f"\n  {C.GREEN}✓ Updated to v{latest}!{C.RESET}\n")
+
+def cmd_export(args):
+    print_header()
+    sync_gpu_database()
+    print(f"  {C.BOLD}Generating system report...{C.RESET}\n")
+
+    gpus = detect_gpus()
+    rocm_ver = detect_rocm_version()
+    ov = os.environ.get("HSA_OVERRIDE_GFX_VERSION")
+    vk = _run(["vulkaninfo", "--summary"])
+    vulkan_ok = "Vulkan Instance Version" in vk or "devices" in vk.lower()
+
+    lines = [
+        f"# ROCmFix System Report",
+        f"",
+        f"- **Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- **ROCmFix version:** v{__version__}",
+        f"- **OS:** {detect_os()}",
+        f"- **Shell:** {detect_shell()}",
+        f"",
+        f"## GPUs",
+        f"",
+        f"| Name | PCI ID | Driver | Status |",
+        f"|---|---|---|---|",
+    ]
+    for g in gpus:
+        info = GPU_DATABASE.get(g["pci_id"])
+        status = "Unknown"
+        if info:
+            if info.get("supported"): status = "✅ Native"
+            elif info.get("override"): status = f"⚠️ Needs override {info['override']}"
+            else: status = "🚫 iGPU / not for AI"
+        lines.append(f"| {g['name']} | `{g['pci_id']}` | {g['driver_version']} | {status} |")
+
+    lines += [
+        f"",
+        f"## AI Stack",
+        f"",
+        f"- **ROCm/HIP:** {'✅ ' + rocm_ver if rocm_ver else '❌ Not installed'}",
+        f"- **Vulkan:** {'✅ Working' if vulkan_ok else '❌ Not responding'}",
+        f"- **HSA_OVERRIDE_GFX_VERSION:** {ov or 'Not set'}",
+        f"",
+        f"## Recommendations",
+        f"",
+    ]
+    for g in gpus:
+        info = GPU_DATABASE.get(g["pci_id"])
+        if info:
+            lines.append(f"- **{g['name']}:** Use {info.get('rec_backend','vulkan').upper()} backend")
+            if info.get('override'):
+                lines.append(f"  - HSA_OVERRIDE_GFX_VERSION={info['override']} for HIP")
+
+    lines += [
+        f"",
+        f"---",
+        f"_Generated by ROCmFix v{__version__} — https://github.com/{GITHUB_REPO}_",
+    ]
+
+    desktop = Path.home() / "Desktop"
+    out_dir = desktop if desktop.exists() else Path.cwd()
+    filename = f"rocmfix-report-{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    out_path = out_dir / filename
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+    print(f"  {C.GREEN}✓ Report saved to:{C.RESET}")
+    print(f"  {out_path}\n")
+    print(f"  {C.GRAY}Attach this to GitHub issues or Reddit posts when asking for help.{C.RESET}\n")
 
 def cmd_test(args):
     print_header()
+    sync_gpu_database()
     current = os.environ.get("HSA_OVERRIDE_GFX_VERSION")
     print(f"  HSA_OVERRIDE_GFX_VERSION = {C.BOLD}{current or 'NOT SET'}{C.RESET}\n")
     print("  Running smoke test...\n")
@@ -847,7 +1264,6 @@ def cmd_test(args):
     else:
         print(f"  {C.RED}FAIL: {result['message']}{C.RESET}")
         if result["details"]: print(f"  {C.GRAY}{result['details']}{C.RESET}")
-
     cfg = load_config()
     if cfg.get("telemetry_enabled"):
         gpus, rocm_ver = detect_gpus(), detect_rocm_version()
@@ -855,33 +1271,31 @@ def cmd_test(args):
 
 def cmd_list(args):
     print_header()
+    sync_gpu_database()
     print(f"  {C.BOLD}Known GPUs ({len(GPU_DATABASE)}):{C.RESET}\n")
     print(f"  {'PCI':<6} {'Name':<40} {'Arch':<8} {'Override':<10} Status")
     print(f"  {'-'*6} {'-'*40} {'-'*8} {'-'*10} {'-'*6}")
     for pid, info in GPU_DATABASE.items():
-        st = f"{C.GREEN}Native{C.RESET}" if info["supported"] else f"{C.YELLOW}Override{C.RESET}"
-        ov = info["override"] or "-"
+        st = f"{C.GREEN}Native{C.RESET}" if info.get("supported") else f"{C.YELLOW}Override{C.RESET}"
+        ov = info.get("override") or "-"
         print(f"  {pid:<6} {info['name']:<40} {info['arch']:<8} {ov:<10} {st}")
 
 def cmd_undo(args):
     print_header()
-    print(f"  {C.BOLD}Undoing last override...{C.RESET}\n")
     result = undo_last_override()
     if result["success"]:
         print(f"  {C.GREEN}✓ Reverted.{C.RESET}")
-        if result.get("restored_from"): print(f"  {C.GRAY}Restored from: {result['restored_from']}{C.RESET}")
-        print(f"  {C.YELLOW}⚠ Open a NEW terminal for changes to take effect.{C.RESET}")
+        print(f"  {C.YELLOW}⚠ Open a NEW terminal for changes.{C.RESET}")
     else: print(f"  {C.RED}✗ {result['error']}{C.RESET}")
 
 def cmd_telemetry(args):
     print_header()
     cfg = load_config()
-    print(f"  {C.BOLD}Telemetry status:{C.RESET} {C.GREEN if cfg.get('telemetry_enabled') else C.RED}{'ENABLED' if cfg.get('telemetry_enabled') else 'DISABLED'}{C.RESET}\n")
+    print(f"  {C.BOLD}Status:{C.RESET} {C.GREEN if cfg.get('telemetry_enabled') else C.RED}{'ENABLED' if cfg.get('telemetry_enabled') else 'DISABLED'}{C.RESET}\n")
     print(f"  Queued reports: {len(list(OUTBOX_DIR.glob('*.json'))) if OUTBOX_DIR.exists() else 0}")
     print(f"  Endpoint: {TELEMETRY_ENDPOINT}\n")
-    print(f"  {C.BOLD}Options:{C.RESET}")
-    print("    [E] Enable telemetry\n    [D] Disable telemetry\n    [F] Force flush queue now\n    [S] Show sample payload\n    [Q] Quit")
-    try: choice = input("\n  > ").strip().lower()
+    print(f"  [E] Enable  [D] Disable  [F] Flush  [S] Sample  [Q] Quit")
+    try: choice = input("  > ").strip().lower()
     except: return
     if choice == "e": cfg["telemetry_enabled"] = True; save_config(cfg); print(f"  {C.GREEN}✓ Enabled{C.RESET}")
     elif choice == "d": cfg["telemetry_enabled"] = False; save_config(cfg); print(f"  {C.YELLOW}Disabled{C.RESET}")
@@ -892,12 +1306,11 @@ def cmd_telemetry(args):
 
 def cmd_verify(args):
     print_header()
-    print("  Verify a specific PCI ID + override.\n")
-    pci_id = input("  PCI ID (4 hex): ").strip().lower()
-    override = input("  Override (e.g. 11.0.0): ").strip()
+    sync_gpu_database()
+    pci_id = input("  PCI ID: ").strip().lower()
+    override = input("  Override: ").strip()
     info = GPU_DATABASE.get(pci_id)
-    if info: print(f"\n  {C.YELLOW}Already in DB:{C.RESET} {info['name']} (override: {info['override']})")
-    print(f"\n  Running smoke test with override={override}...\n")
+    if info: print(f"\n  {C.YELLOW}Already in DB:{C.RESET} {info['name']} (override: {info.get('override')})")
     result = run_smoke_test(override or None)
     if result["success"]: print(f"  {C.GREEN}✓ PASS: {result['message']}{C.RESET}")
     else: print(f"  {C.RED}✗ FAIL: {result['message']}{C.RESET}")
@@ -905,31 +1318,45 @@ def cmd_verify(args):
 def cmd_contribute(args):
     print_header()
     pci_id = input("  PCI ID: ").strip().lower()
-    name = input("  GPU Name: ").strip()
-    arch = input("  Arch (RDNA4/RDNA3/RDNA2/Vega): ").strip()
+    name = input("  Name: ").strip()
+    arch = input("  Arch: ").strip()
     gfx = input("  gfx target: ").strip()
     ov = input("  Override (blank=none): ").strip()
     notes = input("  Notes: ").strip()
     print(f'\n    "{pci_id}": {{')
     print(f'        "name": "{name}", "arch": "{arch}",')
     print(f'        "gfx_target": "{gfx}",')
-    print(f'        "override": {"\"" + ov + "\"" if ov else "None"},')
-    print(f'        "supported": {ov == ""},')
+    print(f'        "override": {"\"" + ov + "\"" if ov else "null"},')
+    print(f'        "supported": {str(ov == "").lower()},')
     print(f'        "known_issues": [], "notes": "{notes}", "rec_backend": "vulkan"\n    }},')
+
+def cmd_sync(args):
+    print_header()
+    print(f"  {C.BOLD}Force-syncing GPU database...{C.RESET}\n")
+    result = sync_gpu_database(force=True)
+    if result == "fetched":
+        print(f"  {C.GREEN}✓ Fetched fresh DB ({len(GPU_DATABASE)} GPUs){C.RESET}")
+    elif result == "cached":
+        print(f"  {C.YELLOW}⚠ Server unreachable, using cached DB{C.RESET}")
+    else:
+        print(f"  {C.RED}✗ Fell back to hardcoded DB{C.RESET}")
 
 def main():
     enable_ansi()
     parser = argparse.ArgumentParser(prog="rocmfix", description="AMD GPU override helper")
     parser.add_argument("--version", action="version", version=f"ROCmFix {__version__}")
     parser.add_argument("command", nargs="?", default="detect",
-                        choices=["detect", "test", "list", "contribute", "install", "verify", "undo", "telemetry", "doctor", "install-hip", "bench"])
+                        choices=["detect", "test", "list", "contribute", "install", "verify",
+                                 "undo", "telemetry", "doctor", "install-hip", "bench",
+                                 "update", "export", "sync"])
     args = parser.parse_args()
 
     dispatch = {
         "detect": cmd_detect, "test": cmd_test, "list": cmd_list, "verify": cmd_verify,
         "contribute": cmd_contribute, "install": lambda a: install_globally(),
         "undo": cmd_undo, "telemetry": cmd_telemetry, "doctor": cmd_doctor,
-        "install-hip": cmd_install_hip, "bench": cmd_bench
+        "install-hip": cmd_install_hip, "bench": cmd_bench,
+        "update": cmd_update, "export": cmd_export, "sync": cmd_sync,
     }
     dispatch[args.command](args)
 
