@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ROCmFix v0.1.4 — Cross-platform AMD GPU override detector and tester for ROCm/HIP.
-Adds: self-updater, live DB sync, LM Studio bench, benchmark telemetry, system export.
+ROCmFix v0.1.5 — Cross-platform AMD GPU override detector and tester for ROCm/HIP.
+Adds: Linux driver detection fix, Linux permission diagnostics, 'optimize' system tuner, 'install-rocm'.
 """
 
 import os
@@ -21,7 +21,7 @@ import webbrowser
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 GITHUB_REPO = "xanpavle/rocmfix"
 
 TELEMETRY_ENDPOINT = "https://rocmfix-data.onrender.com/submit"
@@ -70,8 +70,14 @@ GPU_DATABASE = dict(FALLBACK_DATABASE)
 # ──────────────────────────────────────────────────────────────────────
 
 class C:
-    RESET = "\033[0m"; BOLD = "\033[1m"; RED = "\033[91m"; GREEN = "\033[92m"
-    YELLOW = "\033[93m"; BLUE = "\033[94m"; CYAN = "\033[96m"; GRAY = "\033[90m"
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    RED    = "\033[91m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE   = "\033[94m"
+    CYAN   = "\033[96m"
+    GRAY   = "\033[90m"
 
 def enable_ansi():
     if platform.system().lower() == "windows":
@@ -120,15 +126,10 @@ def save_config(cfg: dict):
 # ──────────────────────────────────────────────────────────────────────
 
 def sync_gpu_database(force: bool = False) -> str:
-    """
-    Fetches gpus.json from Render server, caches locally.
-    Returns: 'fetched', 'cached', 'fallback'
-    """
     global GPU_DATABASE
     _ensure_config_dirs()
     cfg = load_config()
 
-    # Check if cache is still fresh
     if not force and DB_CACHE_FILE.exists():
         last_sync_str = cfg.get("last_db_sync")
         if last_sync_str:
@@ -144,7 +145,6 @@ def sync_gpu_database(force: bool = False) -> str:
             except Exception:
                 pass
 
-    # Try to fetch fresh
     try:
         req = urllib.request.Request(DATABASE_ENDPOINT, headers={"User-Agent": f"ROCmFix/{__version__}"})
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -158,7 +158,6 @@ def sync_gpu_database(force: bool = False) -> str:
     except Exception:
         pass
 
-    # Fallback: try old cache
     if DB_CACHE_FILE.exists():
         try:
             cached = json.loads(DB_CACHE_FILE.read_text())
@@ -182,7 +181,6 @@ def _version_tuple(v: str) -> tuple:
         return (0, 0, 0)
 
 def check_for_updates_silent() -> str | None:
-    """Silently checks GitHub for a new release. Returns latest tag if newer, else None."""
     cfg = load_config()
     last_check_str = cfg.get("last_update_check")
     if last_check_str:
@@ -272,22 +270,41 @@ def _detect_windows_registry() -> list[dict]:
     except OSError: pass
     return gpus
 
+def _get_linux_driver_version() -> str:
+    """Robust Linux amdgpu driver / kernel version detector."""
+    # 1. Sysfs module version
+    ver_file = Path("/sys/module/amdgpu/version")
+    if ver_file.exists():
+        try:
+            v = ver_file.read_text().strip()
+            if v: return v
+        except OSError: pass
+
+    # 2. Modinfo amdgpu
+    mod_ver = _run(["modinfo", "-F", "version", "amdgpu"]).strip()
+    if mod_ver and "not found" not in mod_ver.lower() and "error" not in mod_ver.lower():
+        return mod_ver
+
+    # 3. Kernel version fallback (amdgpu is in-tree in Linux kernel)
+    kernel_ver = _run(["uname", "-r"]).strip()
+    if kernel_ver:
+        return f"Kernel {kernel_ver}"
+
+    return "unknown"
+
 def _detect_linux() -> list[dict]:
     gpus = []
     output = _run(["lspci", "-nn", "-d", "1002::"])
     pattern = re.compile(r"\[1002:([0-9a-fA-F]{4})\]")
+    driver_ver = _get_linux_driver_version()
+
     for line in output.splitlines():
         match = pattern.search(line)
         if match and any(kw in line for kw in ["VGA", "Display", "3D"]):
             pci_id = match.group(1).lower()
             name_match = re.search(r"\]:\s*(.+?)\s*\[1002:", line)
             name = name_match.group(1) if name_match else "Unknown AMD GPU"
-            driver = "unknown"
-            ver_file = Path("/sys/module/amdgpu/version")
-            if ver_file.exists():
-                try: driver = ver_file.read_text().strip()
-                except OSError: pass
-            gpus.append({"pci_id": pci_id, "name": name, "driver_version": driver, "raw_pnp": line.strip()})
+            gpus.append({"pci_id": pci_id, "name": name, "driver_version": driver_ver, "raw_pnp": line.strip()})
     return gpus
 
 def detect_gpus() -> list[dict]:
@@ -314,6 +331,7 @@ def detect_rocm_version():
 
 def analyze_driver(drv_ver: str) -> dict | None:
     if not drv_ver or drv_ver == "unknown": return None
+    if drv_ver.startswith("Kernel"): return {"status": "ok", "msg": f"{drv_ver} (Linux In-Tree Driver)"}
     try:
         major = int(drv_ver.split('.')[0])
         if major >= 32: return {"status": "ok", "msg": "Adrenalin 24.x+ (Good)"}
@@ -323,7 +341,7 @@ def analyze_driver(drv_ver: str) -> dict | None:
         return None
 
 # ──────────────────────────────────────────────────────────────────────
-# SMOKE TEST
+# SMOKE TESTING
 # ──────────────────────────────────────────────────────────────────────
 
 def run_smoke_test(override):
@@ -339,10 +357,19 @@ def run_smoke_test(override):
                 return {"success": False, "message": "rocminfo failed.", "details": (res.stderr or res.stdout)[:300]}
             gpu_count = res.stdout.count("Device Type:                     GPU")
             if gpu_count == 0:
-                return {"success": False, "message": "0 GPU agents.", "details": ""}
+                # Check user group permissions
+                groups = _run(["groups"]).strip()
+                missing = []
+                if "render" not in groups: missing.append("render")
+                if "video" not in groups: missing.append("video")
+                if missing:
+                    details = f"Missing user groups: {', '.join(missing)}. Run: sudo usermod -aG render,video $USER"
+                else:
+                    details = "Needs HSA_OVERRIDE_GFX_VERSION set or ROCm service restart."
+                return {"success": False, "message": "0 GPU agents found by rocminfo.", "details": details}
             return {"success": True, "message": f"ROCm detected {gpu_count} GPU agent(s).", "details": f"override={override or 'not set'}"}
         except FileNotFoundError:
-            return {"success": False, "message": "rocminfo not found.", "details": ""}
+            return {"success": False, "message": "rocminfo not found.", "details": "Run 'rocmfix install-rocm'"}
         except Exception as e:
             return {"success": False, "message": str(e), "details": ""}
     elif os_name == "windows":
@@ -582,7 +609,6 @@ def maybe_print_update_banner():
 # ──────────────────────────────────────────────────────────────────────
 
 def find_lm_studio_models() -> list[str]:
-    """Scan LM Studio's model directory."""
     home = Path.home()
     candidates = [
         home / ".cache" / "lm-studio" / "models",
@@ -597,7 +623,6 @@ def find_lm_studio_models() -> list[str]:
     return models
 
 def bench_via_ollama(gpu_override: str | None) -> dict:
-    """Run Vulkan vs HIP bench through Ollama. Returns dict with results."""
     if "ollama version" not in _run(["ollama", "--version"]):
         return {"error": "ollama not found"}
 
@@ -649,7 +674,6 @@ def bench_via_ollama(gpu_override: str | None) -> dict:
     return results
 
 def bench_via_lmstudio(gpu_override: str | None) -> dict:
-    """LM Studio bench: start server, load model, wait until ready, then chat."""
     lms_out = _run(["lms", "version"])
     if not lms_out.strip():
         if not _run(["lms", "--help"]).strip() and shutil.which("lms") is None:
@@ -734,7 +758,6 @@ def bench_via_lmstudio(gpu_override: str | None) -> dict:
         return False
 
     def _unload_all(env: dict | None = None):
-        """Best-effort unload so VRAM is free before next backend / exit."""
         e = env or os.environ.copy()
         cmds = [
             ["lms", "unload", "--all"],
@@ -982,7 +1005,10 @@ def cmd_doctor(args):
     else:
         rocm = detect_rocm_version()
         if rocm: print(f"  {C.GREEN}✓ ROCm Installed:{C.RESET} v{rocm}")
-        else: print(f"  {C.RED}✗ ROCm NOT FOUND{C.RESET}")
+        else:
+            print(f"  {C.RED}✗ ROCm NOT FOUND{C.RESET}")
+            print(f"    {C.CYAN}Run: rocmfix install-rocm{C.RESET}")
+
     print(f"\n{C.BOLD}3. Vulkan Engine{C.RESET}")
     vk = _run(["vulkaninfo", "--summary"])
     if "Vulkan Instance Version" in vk or "devices" in vk.lower(): print(f"  {C.GREEN}✓ Vulkan API ready{C.RESET}")
@@ -1051,6 +1077,126 @@ def cmd_install_hip(args):
         try: webbrowser.open(hub)
         except: pass
         print(f"  URL: {hub}\n")
+
+def cmd_install_rocm(args):
+    print_header()
+    if detect_os() != "linux":
+        print(f"  {C.RED}This command is for Linux only. On Windows, use 'rocmfix install-hip'.{C.RESET}\n")
+        return
+
+    print(f"  {C.BOLD}{C.CYAN}🐧 Linux ROCm & User Permissions Setup{C.RESET}\n")
+
+    os_release = Path("/etc/os-release")
+    distro = "unknown"
+    if os_release.exists():
+        content = os_release.read_text().lower()
+        if "ubuntu" in content or "debian" in content: distro = "ubuntu"
+        elif "fedora" in content or "rhel" in content: distro = "fedora"
+        elif "arch" in content: distro = "arch"
+
+    print(f"  Detected Linux Distribution: {C.BOLD}{distro.title()}{C.RESET}\n")
+
+    if distro == "ubuntu":
+        print("  1. Install ROCm packages:")
+        print(f"     {C.CYAN}sudo apt update && sudo apt install -y rocm-hip-sdk rocminfo{C.RESET}\n")
+    elif distro == "fedora":
+        print("  1. Install ROCm packages:")
+        print(f"     {C.CYAN}sudo dnf install -y rocm-hip rocminfo{C.RESET}\n")
+    elif distro == "arch":
+        print("  1. Install ROCm packages:")
+        print(f"     {C.CYAN}sudo pacman -S --needed rocm-hip-sdk rocminfo{C.RESET}\n")
+
+    print("  2. Add your user to GPU permission groups:")
+    print(f"     {C.CYAN}sudo usermod -aG render,video $USER{C.RESET}\n")
+    print(f"  {C.YELLOW}⚠ Log out and log back in for group permissions to take effect.{C.RESET}\n")
+
+def cmd_optimize(args):
+    print_header()
+    os_name = detect_os()
+    print(f"  {C.BOLD}{C.CYAN}⚡ System Deep Optimizer ({os_name.title()}){C.RESET}\n")
+
+    if os_name == "windows":
+        print(f"  {C.BOLD}Checking Windows Registry TDR, HAGS, and ULPS settings...{C.RESET}\n")
+        try:
+            import winreg
+            tdr_key = r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+            
+            # Read TDR
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, tdr_key, 0, winreg.KEY_READ) as k:
+                    try: tdr_val, _ = winreg.QueryValueEx(k, "TdrDelay")
+                    except FileNotFoundError: tdr_val = None
+            except Exception: tdr_val = None
+
+            print(f"  • TDR Delay (GPU Timeout): {tdr_val if tdr_val is not None else 'Default (2 seconds)'}")
+            if tdr_val is None or tdr_val < 60:
+                print(f"    {C.YELLOW}⚠ Low TDR delay causes Windows to crash GPUs during long LLM tasks.{C.RESET}")
+
+            # Read HAGS
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, tdr_key, 0, winreg.KEY_READ) as k:
+                    try: hags_val, _ = winreg.QueryValueEx(k, "HwSchMode")
+                    except FileNotFoundError: hags_val = None
+            except Exception: hags_val = None
+
+            print(f"  • HAGS (Hardware Scheduling): {'Enabled (2)' if hags_val == 2 else 'Disabled (1)' if hags_val == 1 else 'Not set'}")
+            if hags_val == 2:
+                print(f"    {C.YELLOW}⚠ HAGS causes random VRAM crashes on AMD GPUs in local AI.{C.RESET}")
+
+            print(f"\n  {C.BOLD}Apply Recommended Optimizations?{C.RESET}")
+            print("    - Set TdrDelay = 60s (Fixes GPU timeout crashes)")
+            print("    - Set TdrDdiDelay = 60s")
+            print("    - Disable EnableUlps (Fixes GPU sleep crashes)")
+            print("    - Disable HAGS (Fixes VRAM allocation crashes)\n")
+
+            ans = input("  Apply optimizations? [Y/n]: ").strip().lower()
+            if ans != 'n':
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, tdr_key, 0, winreg.KEY_ALL_ACCESS) as k:
+                    winreg.SetValueEx(k, "TdrDelay", 0, winreg.REG_DWORD, 60)
+                    winreg.SetValueEx(k, "TdrDdiDelay", 0, winreg.REG_DWORD, 60)
+                    winreg.SetValueEx(k, "HwSchMode", 0, winreg.REG_DWORD, 1)
+
+                base_class = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+                ulps_count = 0
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base_class, 0, winreg.KEY_READ) as class_key:
+                    i = 0
+                    while True:
+                        try:
+                            sub = winreg.EnumKey(class_key, i)
+                            i += 1
+                            if sub == "Properties": continue
+                            try:
+                                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{base_class}\\{sub}", 0, winreg.KEY_ALL_ACCESS) as sk:
+                                    winreg.SetValueEx(sk, "EnableUlps", 0, winreg.REG_DWORD, 0)
+                                    ulps_count += 1
+                            except Exception: pass
+                        except OSError: break
+
+                print(f"\n  {C.GREEN}✓ Optimizations applied successfully!{C.RESET}")
+                print(f"    - TdrDelay set to 60s")
+                print(f"    - HAGS set to Disabled")
+                print(f"    - EnableUlps disabled across {ulps_count} key(s)")
+                print(f"\n  {C.YELLOW}⚠ Please RESTART YOUR PC for Windows changes to take full effect.{C.RESET}\n")
+
+        except PermissionError:
+            print(f"\n  {C.RED}✗ Permission Denied: Run Command Prompt as ADMINISTRATOR to apply optimizations.{C.RESET}\n")
+        except Exception as e:
+            print(f"\n  {C.RED}✗ Failed to apply optimizations: {e}{C.RESET}\n")
+
+    elif os_name == "linux":
+        print(f"  {C.BOLD}Checking Linux User Permissions...{C.RESET}\n")
+        groups = _run(["groups"]).strip()
+        missing = []
+        if "render" not in groups: missing.append("render")
+        if "video" not in groups: missing.append("video")
+
+        if missing:
+            print(f"  {C.YELLOW}⚠ Missing user group permissions: {', '.join(missing)}{C.RESET}")
+            print(f"    Your user cannot access AMD GPU device nodes directly.")
+            print(f"\n  Fix command:")
+            print(f"    {C.CYAN}sudo usermod -aG render,video $USER{C.RESET}\n")
+        else:
+            print(f"  {C.GREEN}✓ User permissions ok (in render and video groups){C.RESET}\n")
 
 def cmd_bench(args):
     print_header()
@@ -1347,16 +1493,16 @@ def main():
     parser.add_argument("--version", action="version", version=f"ROCmFix {__version__}")
     parser.add_argument("command", nargs="?", default="detect",
                         choices=["detect", "test", "list", "contribute", "install", "verify",
-                                 "undo", "telemetry", "doctor", "install-hip", "bench",
-                                 "update", "export", "sync"])
+                                 "undo", "telemetry", "doctor", "install-hip", "install-rocm",
+                                 "bench", "update", "export", "sync", "optimize"])
     args = parser.parse_args()
 
     dispatch = {
         "detect": cmd_detect, "test": cmd_test, "list": cmd_list, "verify": cmd_verify,
         "contribute": cmd_contribute, "install": lambda a: install_globally(),
         "undo": cmd_undo, "telemetry": cmd_telemetry, "doctor": cmd_doctor,
-        "install-hip": cmd_install_hip, "bench": cmd_bench,
-        "update": cmd_update, "export": cmd_export, "sync": cmd_sync,
+        "install-hip": cmd_install_hip, "install-rocm": cmd_install_rocm, "bench": cmd_bench,
+        "update": cmd_update, "export": cmd_export, "sync": cmd_sync, "optimize": cmd_optimize,
     }
     dispatch[args.command](args)
 
