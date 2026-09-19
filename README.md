@@ -2,7 +2,7 @@
 
 # 🔧 ROCmFix
 
-### Auto-detect your AMD GPU and get the right ROCm override in seconds.
+### Auto-detect your AMD GPU, fix ROCm overrides, and benchmark your AI backends in seconds.
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -17,16 +17,17 @@
 
 ## ❓ What is this?
 
-If you've ever tried to run local AI (llama.cpp, PyTorch, Stable Diffusion) on an AMD GPU and hit cryptic errors like `HSA_STATUS_ERROR_INVALID_ISA` or `No compatible GPU agent found`, you probably needed to set `HSA_OVERRIDE_GFX_VERSION`. 
+Running local AI (llama.cpp, Ollama, LM Studio, PyTorch) on AMD GPUs often leads to cryptic errors like `HSA_STATUS_ERROR_INVALID_ISA` or silent fallbacks to CPU. Usually, you just need to set the `HSA_OVERRIDE_GFX_VERSION` environment variable.
 
-**ROCmFix detects your exact AMD GPU, looks it up in a community database, and automatically applies the correct shell environment override for you.**
+**ROCmFix** detects your exact AMD GPU, checks a live community database, automatically applies the correct shell environment override, and runs health diagnostics to ensure your setup is ready.
 
 ### ✨ Features
-* **Auto-Apply:** Automatically modifies CMD, PowerShell, Bash, Zsh, or Fish config to apply the override.
-* **Smart Detection:** Uses Windows Registry and Linux `lspci` for foolproof GPU detection.
-* **Undo System:** Safely revert any auto-applied changes with `rocmfix undo`.
-* **Telemetry (Opt-in):** Help grow the database by anonymously sharing your GPU detection results.
-* **RDNA4 Ready:** Day-one support for RX 9000 series GPUs.
+* **Auto-Apply & Undo:** Automatically modifies CMD, PowerShell, Bash, Zsh, or Fish configs to apply overrides safely.
+* **`rocmfix doctor`:** Scans your hardware, Adrenalin drivers, HIP SDK, and Vulkan API to diagnose issues.
+* **`rocmfix bench`:** A 10-second backend race! Temporarily isolates Ollama or LM Studio, runs a generation test using Vulkan, then HIP, and tells you which is faster on your PC.
+* **`rocmfix install-hip`:** Missing the HIP SDK on Windows? This safely downloads and launches the official AMD installer for you.
+* **Live Database & Self-Updater:** Fetches new GPUs from the cloud daily, and updates itself via `rocmfix update`.
+* **Export System Report:** Generate a Markdown file of your setup for Reddit/Discord help posts.
 
 ---
 
@@ -55,75 +56,61 @@ python rocmfix.py
 
 | Command | What it does |
 |---|---|
-| `python rocmfix.py` | Detect GPU, suggest override, and optionally auto-apply |
-| `python rocmfix.py test` | Smoke test current override to see if ROCm/HIP detects it |
-| `python rocmfix.py undo` | Safely revert the last auto-applied override |
-| `python rocmfix.py list` | Show all GPUs currently supported in the database |
-| `python rocmfix.py telemetry`| Manage your anonymous data sharing settings |
-| `python rocmfix.py install` | Install `rocmfix` as a global command on your system |
+| `rocmfix` | Detect GPU, suggest override, and auto-apply |
+| `rocmfix doctor` | Full health check of drivers, HIP, and Vulkan |
+| `rocmfix bench` | Benchmark Vulkan vs HIP/ROCm in LM Studio or Ollama |
+| `rocmfix install-hip`| Download and install the AMD HIP SDK (Windows) |
+| `rocmfix export` | Generate a Markdown system report for troubleshooting |
+| `rocmfix update` | Update ROCmFix to the latest version from GitHub |
+| `rocmfix sync` | Force-fetch the latest GPU database from the community server |
+| `rocmfix test` | Smoke test current override to see if ROCm/HIP detects it |
+| `rocmfix undo` | Safely revert the last auto-applied override |
+| `rocmfix list` | Show all 17+ GPUs currently supported in the database |
+| `rocmfix telemetry`| Manage your anonymous benchmark sharing settings |
+| `rocmfix install` | Install `rocmfix` as a global command on your system |
 
 ---
 
 ## 🎮 Supported GPUs
 
-| PCI ID | GPU | Arch | Override | Status |
-|--------|-----|------|----------|--------|
-| `7550` | RX 9070 XT / 9070 / GRE | RDNA4 | — | ✅ Native |
-| `7590` | RX 9060 XT / 9060 / 9050 | RDNA4 | `12.0.1` | ⚠️ Override |
-| `744c` | RX 7900 XTX | RDNA3 | — | ✅ Native |
-| `744e` | RX 7900 XT | RDNA3 | — | ✅ Native |
-| `747e` | RX 7900 GRE / 7800 XT var. | RDNA3 | — | ✅ Native* |
-| `7470` | RX 7800 XT | RDNA3 | `11.0.0` | ⚠️ Override |
-| `7471` | RX 7700 XT | RDNA3 | `11.0.0` | ⚠️ Override |
-| `7480` | RX 7600 | RDNA3 | `11.0.0` | ⚠️ Override |
-| `7483` | RX 7600 XT | RDNA3 | `11.0.0` | ⚠️ Override |
-| `73af` | RX 6900 XT | RDNA2 | — | ✅ Native |
-| `73bf` | RX 6800 XT / 6800 | RDNA2 | — | ✅ Native |
-| `73df` | RX 6700 XT | RDNA2 | `10.3.0` | ⚠️ Override |
-| `73ff` | RX 6600 XT / 6600 | RDNA2 | `10.3.0` | ⚠️ Override |
-| `743f` | RX 6500 XT | RDNA2 | `10.3.0` | ⚠️ Override |
-| `164e` | Ryzen 7000 iGPU | RDNA2 | — | 🚫 iGPU |
+ROCmFix supports **RDNA4** (RX 9070/9060 series), **RDNA3** (RX 7000 series), **RDNA2** (RX 6000 series), and Integrated Graphics. 
 
-*\*Some 7800 XT board variants share the 7900 GRE PCI ID. If HIP fails, try override `11.0.0`.*
+*New GPUs are synced automatically from our live database without needing to update the app!*
 
 **Don't see your card?** Run `python rocmfix.py` — it will generate a pre-filled GitHub issue link so you can contribute your GPU!
+
+---
+
+## 🔥 HIP vs Vulkan — Which should I use?
+
+If you're running **llama.cpp / LM Studio / Ollama** on a consumer AMD card (especially on Windows):
+
+| | Vulkan | HIP / ROCm |
+|---|---|---|
+| **Setup** | ✅ Zero config | ⚠️ Needs HIP SDK + overrides |
+| **Windows** | ✅ Works out of the box | ⚠️ HIP SDK still maturing |
+| **Linux** | ✅ Good | ✅ Better |
+| **Consumer RDNA3 perf** | ✅ Often faster | ⚠️ Sometimes slower |
+| **PyTorch support** | ❌ Limited | ✅ Full support |
+
+### TL;DR
+- **Running LLMs on Windows?** → Try **Vulkan** first. Run `rocmfix bench` to verify.
+- **PyTorch / Stable Diffusion?** → Run `rocmfix install-hip`, then apply the override ROCmFix gives you.
 
 ---
 
 ## 📊 Privacy & Telemetry
 
 ROCmFix includes an **opt-in** telemetry system to help grow the community database. 
-If you choose to enable it, ROCmFix securely sends your GPU model, PCI ID, OS, Driver version, and Test pass/fail status to a private collector.
-
-**We never collect:** Usernames, IPs, file paths, personal data, or AI model data.
-Read the full privacy details in [PRIVACY.md](PRIVACY.md).
-
----
-
-## 🔥 HIP vs Vulkan — Which should I use?
-
-If you're running **llama.cpp** on a consumer AMD card (especially on Windows), you have two GPU backends available:
-
-| | Vulkan | HIP / ROCm |
-|---|---|---|
-| **Setup** | ✅ Zero config | ⚠️ Needs HIP SDK + overrides |
-| **Windows** | ✅ Works out of the box | ⚠️ HIP SDK still maturing |
-| **Linux** | ✅ Good | ✅ Better on datacenter cards |
-| **Consumer RDNA3 perf** | ✅ Often faster | ⚠️ Sometimes slower |
-| **PyTorch support** | ❌ Limited | ✅ Full support |
-
-### TL;DR
-- **llama.cpp on Windows?** → Use the **Vulkan** build. No HIP SDK needed. Just set the override and go.
-- **PyTorch / Stable Diffusion?** → Install the **HIP SDK** and use the override ROCmFix gives you.
-- **Linux?** → **ROCm** is more mature there. Use the override + ROCm packages.
+If enabled, ROCmFix securely sends your GPU model, driver version, OS, and benchmark results to a private collector. **We never collect usernames, IPs, file paths, or AI prompts.** Read the full details in `PRIVACY.md`.
 
 ---
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the `LICENSE` file for details.
 
 <div align="center">
-<b>If this saved you 30 minutes of Reddit digging, drop a ⭐</b><br>
+<b>If this saved you hours of Reddit digging, drop a ⭐</b><br>
 Made for the local AI community by <a href="https://github.com/xanpavle">xanpavle</a>
 </div>
