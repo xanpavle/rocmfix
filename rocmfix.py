@@ -29,6 +29,7 @@ DATABASE_ENDPOINT = "https://rocmfix-data.onrender.com/gpus.json"
 UPDATE_CHECK_ENDPOINT = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 UPDATE_DOWNLOAD_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/rocmfix.py"
 TELEMETRY_TIMEOUT = 60
+BENCH_OLLAMA_PORT = 11435  # private port for the bench server; 11434 stays the user's
 
 CONFIG_DIR = Path.home() / ".rocmfix"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -622,41 +623,85 @@ def find_lm_studio_models() -> list[str]:
                 models.append(str(gguf))
     return models
 
+def _ollama_ready(port: int, seconds: int = 20) -> bool:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/version", timeout=2).read()
+            return True
+        except Exception:
+            time.sleep(1)
+    return False
+
+def _ollama_models(port: int) -> list[dict]:
+    """Models the server on this port has, smallest first.
+
+    Smallest first because the benchmark compares backends, not model quality,
+    and the previous version took whatever `ollama list` happened to print first.
+    """
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/tags", timeout=10) as resp:
+            models = json.loads(resp.read()).get("models") or []
+    except Exception:
+        return []
+    return sorted((m for m in models if m.get("name")), key=lambda m: m.get("size") or 0)
+
 def bench_via_ollama(gpu_override: str | None) -> dict:
-    if "ollama version" not in _run(["ollama", "--version"]):
-        return {"error": "ollama not found"}
+    # shutil.which, not `ollama --version`: that string only appears when a
+    # server is reachable, so a stopped server made Ollama look uninstalled.
+    if shutil.which("ollama") is None:
+        return {"error": "ollama not found on PATH"}
 
-    models_out = _run(["ollama", "list"])
-    models = [line.split()[0] for line in models_out.splitlines()[1:] if line.strip()]
-    if not models:
-        print(f"  {C.YELLOW}Pulling qwen2.5:0.5b (~400MB)...{C.RESET}")
-        subprocess.run(["ollama", "pull", "qwen2.5:0.5b"])
-        models = ["qwen2.5:0.5b"]
+    port = BENCH_OLLAMA_PORT
+    base_env = os.environ.copy()
+    # OLLAMA_HOST points at a private port, so the user's own server keeps
+    # running. The previous version ran `pkill -9 ollama` first and never
+    # restarted anything.
+    base_env["OLLAMA_HOST"] = f"127.0.0.1:{port}"
+    if gpu_override: base_env["HSA_OVERRIDE_GFX_VERSION"] = gpu_override
+    print(f"  Benchmark server on port {port}; any Ollama you already run is left alone.\n")
 
-    model = models[0]
+    def serve(env: dict):
+        return subprocess.Popen(["ollama", "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def stop(proc):
+        try: proc.kill()
+        except Exception: pass
+
+    proc = serve(base_env)
+    try:
+        if not _ollama_ready(port):
+            return {"error": f"'ollama serve' did not answer on port {port}"}
+        models = _ollama_models(port)
+        if not models:
+            print(f"  {C.YELLOW}No models installed. qwen2.5:0.5b is about 400 MB.{C.RESET}")
+            try: pull = input("  Download it now? [y/N]: ").strip().lower() == "y"
+            except (EOFError, KeyboardInterrupt): pull = False
+            if not pull:
+                return {"error": "no models installed; skipped because downloading one was not confirmed"}
+            subprocess.run(["ollama", "pull", "qwen2.5:0.5b"], env=base_env)
+            models = _ollama_models(port)
+        if not models:
+            return {"error": "no usable models"}
+    finally:
+        stop(proc)
+
+    model = models[0]["name"]
     prompt = "Write a 50 word story about a robot learning to paint."
-    print(f"  Model: {model}\n")
+    print(f"  Model: {model} (smallest installed)\n")
     results = {"runtime": "ollama", "model": model, "vulkan_toks": 0, "hip_toks": 0}
 
     for backend in ["vulkan", "rocm"]:
         print(f"  Testing {C.BOLD}{backend.upper()}{C.RESET}...")
-        if detect_os() == "windows":
-            _run(["taskkill", "/F", "/IM", "ollama_app.exe"])
-            _run(["taskkill", "/F", "/IM", "ollama.exe"])
-        else:
-            _run(["pkill", "-9", "ollama"])
-        time.sleep(1)
-
-        env = os.environ.copy()
+        env = dict(base_env)
         env["OLLAMA_GPU_BACKEND"] = backend
-        if gpu_override:
-            env["HSA_OVERRIDE_GFX_VERSION"] = gpu_override
-
-        proc = subprocess.Popen(["ollama", "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(4)
+        proc = serve(env)
         try:
+            if not _ollama_ready(port):
+                print(f"    {C.RED}→ Server did not start{C.RESET}")
+                continue
             req = urllib.request.Request(
-                "http://127.0.0.1:11434/api/generate",
+                f"http://127.0.0.1:{port}/api/generate",
                 data=json.dumps({"model": model, "prompt": prompt, "stream": False}).encode(),
                 headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=120) as resp:
@@ -666,8 +711,8 @@ def bench_via_ollama(gpu_override: str | None) -> dict:
                 print(f"    {C.GREEN}→ {tok_s} tok/s{C.RESET}")
         except Exception as e:
             print(f"    {C.RED}→ Failed: {e}{C.RESET}")
-        try: proc.kill()
-        except: pass
+        finally:
+            stop(proc)
 
     vk, hp = results["vulkan_toks"], results["hip_toks"]
     results["winner"] = "vulkan" if vk > hp else "hip" if hp > vk else "tie"
@@ -1203,7 +1248,7 @@ def cmd_bench(args):
     sync_gpu_database()
     print(f"{C.BOLD}{C.CYAN}🏎️  Backend Benchmarker{C.RESET}\n")
 
-    has_ollama = "ollama version" in _run(["ollama", "--version"])
+    has_ollama = shutil.which("ollama") is not None
     has_lms = bool(_run(["lms", "version"]))
     lms_models = find_lm_studio_models()
 
