@@ -125,6 +125,48 @@ def save_config(cfg: dict):
 # LIVE DB SYNC
 # ──────────────────────────────────────────────────────────────────────
 
+# HSA_OVERRIDE_GFX_VERSION is always a three-part version such as "11.0.0".
+# The value can arrive from the remote GPU database and is written verbatim into
+# shell startup files, so anything else is rejected instead of trusted.
+OVERRIDE_RE = re.compile(r"\d+\.\d+\.\d+")
+
+def is_valid_override(value) -> bool:
+    # fullmatch, not match: "$" would also accept a trailing newline.
+    return isinstance(value, str) and OVERRIDE_RE.fullmatch(value) is not None
+
+def _normalize_entry(entry) -> dict | None:
+    """Return a well-formed database entry, or None if it cannot be trusted."""
+    if not isinstance(entry, dict): return None
+    name = entry.get("name")
+    if not isinstance(name, str) or not name.strip(): return None
+    override = entry.get("override")
+    if override is not None and not is_valid_override(override): override = None
+    issues = entry.get("known_issues")
+    return {
+        "name": name.strip(),
+        "arch": str(entry.get("arch") or "unknown"),
+        "gfx_target": str(entry.get("gfx_target") or "unknown"),
+        "override": override,
+        "supported": bool(entry.get("supported")),
+        "rec_backend": str(entry.get("rec_backend") or "vulkan"),
+        "known_issues": [str(i) for i in issues] if isinstance(issues, list) else [],
+        "notes": str(entry.get("notes") or ""),
+    }
+
+def _normalize_database(raw) -> dict:
+    """Keep only entries with a plausible PCI id and a usable body.
+
+    The database is fetched from a remote server and decides what gets written
+    into shell startup files, so it is treated as untrusted input.
+    """
+    if not isinstance(raw, dict): return {}
+    out = {}
+    for pci_id, entry in raw.items():
+        if not isinstance(pci_id, str) or not re.fullmatch(r"[0-9a-fA-F]{4}", pci_id): continue
+        normalized = _normalize_entry(entry)
+        if normalized: out[pci_id.lower()] = normalized
+    return out
+
 def sync_gpu_database(force: bool = False) -> str:
     global GPU_DATABASE
     _ensure_config_dirs()
@@ -138,7 +180,7 @@ def sync_gpu_database(force: bool = False) -> str:
                 if datetime.now(timezone.utc) - last < timedelta(hours=DB_CACHE_TTL_HOURS):
                     try:
                         cached = json.loads(DB_CACHE_FILE.read_text())
-                        GPU_DATABASE = cached.get("gpus", FALLBACK_DATABASE)
+                        GPU_DATABASE = _normalize_database(cached.get("gpus")) or dict(FALLBACK_DATABASE)
                         return "cached"
                     except Exception:
                         pass
@@ -150,18 +192,20 @@ def sync_gpu_database(force: bool = False) -> str:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
             if "gpus" in data and isinstance(data["gpus"], dict):
-                DB_CACHE_FILE.write_text(json.dumps(data))
-                cfg["last_db_sync"] = datetime.now(timezone.utc).isoformat()
-                save_config(cfg)
-                GPU_DATABASE = data["gpus"]
-                return "fetched"
+                gpus = _normalize_database(data["gpus"])
+                if gpus:
+                    DB_CACHE_FILE.write_text(json.dumps({"gpus": gpus}))
+                    cfg["last_db_sync"] = datetime.now(timezone.utc).isoformat()
+                    save_config(cfg)
+                    GPU_DATABASE = gpus
+                    return "fetched"
     except Exception:
         pass
 
     if DB_CACHE_FILE.exists():
         try:
             cached = json.loads(DB_CACHE_FILE.read_text())
-            GPU_DATABASE = cached.get("gpus", FALLBACK_DATABASE)
+            GPU_DATABASE = _normalize_database(cached.get("gpus")) or dict(FALLBACK_DATABASE)
             return "cached"
         except Exception:
             pass
@@ -413,6 +457,17 @@ def apply_override_windows(override: str) -> dict:
         return {"success": True, "old_value": old_value, "method": "windows_registry"}
     except Exception as e: return {"success": False, "error": str(e)}
 
+def _is_override_assignment(line: str) -> bool:
+    """True only for lines that actually set HSA_OVERRIDE_GFX_VERSION.
+
+    The previous filter dropped every line containing the variable name, which
+    deleted the user's own comments along with the override.
+    """
+    stripped = line.strip()
+    if stripped.startswith("#"): return False
+    return bool(re.match(r"(?:export\s+)?HSA_OVERRIDE_GFX_VERSION\s*=", stripped)
+                or re.match(r"set\s+(?:-\S+\s+)*HSA_OVERRIDE_GFX_VERSION\s", stripped))
+
 def apply_override_unix(override: str, shell: str) -> dict:
     home = Path.home()
     if shell == "fish": config_path, line = home / ".config" / "fish" / "config.fish", f'set -gx HSA_OVERRIDE_GFX_VERSION {override}\n'
@@ -420,22 +475,38 @@ def apply_override_unix(override: str, shell: str) -> dict:
     else: config_path, line = home / ".bashrc", f'export HSA_OVERRIDE_GFX_VERSION={override}\n'
     marker = "# Added by ROCmFix"
     try:
-        backup = _backup_file(config_path) if config_path.exists() else None
-        existing = config_path.read_text() if config_path.exists() else ""
-        cleaned = [l for l in existing.splitlines(keepends=True) if marker not in l and "HSA_OVERRIDE_GFX_VERSION" not in l]
+        existed = config_path.exists()
+        backup = _backup_file(config_path) if existed else None
+        existing = config_path.read_text() if existed else ""
+        cleaned = [l for l in existing.splitlines(keepends=True)
+                   if marker not in l and not _is_override_assignment(l)]
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(config_path, "w") as f:
             f.writelines(cleaned)
             if cleaned and not cleaned[-1].endswith("\n"): f.write("\n")
             f.write(f"\n{line.rstrip()}  {marker}\n")
-        return {"success": True, "backup": str(backup) if backup else None, "file": str(config_path), "method": f"unix_{shell}"}
+        return {"success": True, "backup": str(backup) if backup else None, "target": str(config_path),
+                "existed": existed, "method": f"unix_{shell}"}
     except Exception as e: return {"success": False, "error": str(e)}
 
 def apply_override(override: str) -> dict:
+    if not is_valid_override(override):
+        return {"success": False, "error": f"Refusing to apply {override!r}: expected a version like 11.0.0."}
     result = apply_override_windows(override) if detect_os() == "windows" else apply_override_unix(override, detect_shell())
     if result.get("success"):
         cfg = load_config()
-        cfg["applied_overrides"].append({"value": override, "timestamp": datetime.now(timezone.utc).isoformat(), "method": result.get("method"), "backup": result.get("backup")})
+        cfg["applied_overrides"].append({
+            "value": override,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "method": result.get("method"),
+            "backup": result.get("backup"),
+            # Recorded so undo() can restore the exact file: the backup name
+            # cannot be parsed back into a path, because ".bashrc.<ts>.bak"
+            # splits on "." to an empty first element.
+            "target": result.get("target"),
+            "existed": result.get("existed"),
+            "old_value": result.get("old_value"),
+        })
         save_config(cfg)
     return result
 
@@ -458,17 +529,24 @@ def undo_last_override() -> dict:
             return {"success": True, "method": "windows_registry"}
         except Exception as e: return {"success": False, "error": str(e)}
     else:
+        target = last.get("target")
+        if not target:
+            return {"success": False, "error": "This entry predates target tracking, so the file to restore is unknown. "
+                    f"The backup is at {last.get('backup') or 'unknown'}; restore it manually."}
         backup = last.get("backup")
-        if backup and Path(backup).exists():
-            try:
-                original_name = Path(backup).name.split(".")[0]
-                target = Path.home() / f".{original_name}" if not original_name.startswith(".") else Path.home() / original_name
-                shutil.copy2(backup, target)
-                cfg["applied_overrides"].pop()
-                save_config(cfg)
-                return {"success": True, "restored_from": backup}
-            except Exception as e: return {"success": False, "error": str(e)}
-        return {"success": False, "error": "No backup file found."}
+        try:
+            if backup and Path(backup).exists():
+                shutil.copy2(backup, Path(target))
+            elif last.get("existed") is False:
+                # We created this file; removing it returns the shell to its
+                # previous state.
+                Path(target).unlink(missing_ok=True)
+            else:
+                return {"success": False, "error": f"No backup file found for {target}."}
+        except Exception as e: return {"success": False, "error": str(e)}
+        cfg["applied_overrides"].pop()
+        save_config(cfg)
+        return {"success": True, "target": target, "restored_from": backup}
 
 # ──────────────────────────────────────────────────────────────────────
 # TELEMETRY
