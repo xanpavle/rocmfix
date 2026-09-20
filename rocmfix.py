@@ -315,13 +315,22 @@ def detect_gpus() -> list[dict]:
 def detect_rocm_version():
     os_name = detect_os()
     if os_name == "linux":
-        version_file = Path("/opt/rocm/.info/version")
-        if version_file.exists():
-            try: return version_file.read_text().strip()
+        # 1. Version file from any /opt/rocm* install (e.g. /opt/rocm-6.2.4)
+        for version_file in sorted(Path("/opt").glob("rocm*/.info/version")):
+            try:
+                v = version_file.read_text().strip()
+                if v: return v
             except OSError: pass
+        # 2. rocminfo (official builds print a "ROCm Version" line)
         output = _run(["rocminfo"])
         match = re.search(r"ROCm Version:\s*([\d.]+)", output)
         if match: return match.group(1)
+        # 3. hipcc (conda-forge and from-source installs have no version file
+        #    and their rocminfo prints only a HIP "Runtime Version" API level)
+        match = re.search(r"HIP version:\s*(\d+(?:\.\d+)+)", _run(["hipcc", "--version"]))
+        if match: return match.group(1)
+        # 4. rocminfo runs but reports no version line
+        if "Agent" in output: return "installed (version unknown)"
     elif os_name == "windows":
         hip_path = os.environ.get("HIP_PATH", "")
         if hip_path:
@@ -1004,7 +1013,9 @@ def cmd_doctor(args):
             print(f"    {C.CYAN}Run: rocmfix install-hip{C.RESET}")
     else:
         rocm = detect_rocm_version()
-        if rocm: print(f"  {C.GREEN}✓ ROCm Installed:{C.RESET} v{rocm}")
+        if rocm:
+            label = f"v{rocm}" if rocm[:1].isdigit() else rocm
+            print(f"  {C.GREEN}✓ ROCm Installed:{C.RESET} {label}")
         else:
             print(f"  {C.RED}✗ ROCm NOT FOUND{C.RESET}")
             print(f"    {C.CYAN}Run: rocmfix install-rocm{C.RESET}")
