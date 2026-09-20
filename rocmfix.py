@@ -1472,7 +1472,11 @@ def cmd_contribute(args):
     print(f'\n    "{pci_id}": {{')
     print(f'        "name": "{name}", "arch": "{arch}",')
     print(f'        "gfx_target": "{gfx}",')
-    print(f'        "override": {"\"" + ov + "\"" if ov else "null"},')
+    # Built outside the f-string: a backslash inside an f-string expression is a
+    # SyntaxError before Python 3.12, which stops this module from importing at
+    # all on 3.10/3.11.
+    override_json = json.dumps(ov) if ov else "null"
+    print(f'        "override": {override_json},')
     print(f'        "supported": {str(ov == "").lower()},')
     print(f'        "known_issues": [], "notes": "{notes}", "rec_backend": "vulkan"\n    }},')
 
