@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rocmfix"
-version = "0.1.1"
+version = "0.1.5"
 description = "Auto-detect AMD GPUs and suggest ROCm HSA_OVERRIDE_GFX_VERSION values"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "YOUR NAME", email = "your@email.com" }
+    { name = "xanpavle" }
 ]
 keywords = ["rocm", "amd", "gpu", "hip", "llama.cpp", "ai"]
 classifiers = [
@@ -29,13 +29,12 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-rocmfix = "rocmfix.cli:main"
+rocmfix = "rocmfix:main"
 
 [project.urls]
-Homepage = "https://github.com/YOURNAME/rocmfix"
-Issues = "https://github.com/YOURNAME/rocmfix/issues"
-Repository = "https://github.com/YOURNAME/rocmfix"
+Homepage = "https://github.com/xanpavle/rocmfix"
+Issues = "https://github.com/xanpavle/rocmfix/issues"
+Repository = "https://github.com/xanpavle/rocmfix"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["rocmfix*"]
+[tool.setuptools]
+py-modules = ["rocmfix"]
