@@ -58,10 +58,13 @@ FALLBACK_DATABASE = {
     "73af": {"name": "RX 6900 XT (Navi 21)", "arch": "RDNA2", "gfx_target": "gfx1030", "override": None, "supported": True, "rec_backend": "hip", "known_issues": [], "notes": "Natively supported."},
     "73bf": {"name": "RX 6800 / 6800 XT / 6900 XT (Navi 21)", "arch": "RDNA2", "gfx_target": "gfx1030", "override": None, "supported": True, "rec_backend": "hip", "known_issues": [], "notes": "Natively supported."},
     "73df": {"name": "RX 6700 XT (Navi 22)", "arch": "RDNA2", "gfx_target": "gfx1031", "override": "10.3.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1030."},
+    "73ef": {"name": "RX 6700S (Navi 23)", "arch": "RDNA2", "gfx_target": "gfx1032", "override": "10.3.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1030."},
     "73ff": {"name": "RX 6600 XT / 6600 (Navi 23)", "arch": "RDNA2", "gfx_target": "gfx1032", "override": "10.3.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1030."},
     "743f": {"name": "RX 6500 XT (Navi 24)", "arch": "RDNA2", "gfx_target": "gfx1034", "override": "10.3.0", "supported": False, "rec_backend": "vulkan", "known_issues": [], "notes": "Override to gfx1030."},
-    "164e": {"name": "Radeon Graphics (Ryzen 7000 iGPU)", "arch": "RDNA2", "gfx_target": "gfx1036", "override": None, "supported": False, "rec_backend": "cpu", "known_issues": [], "notes": "iGPU \u2014 ignore for AI."},
-    "1638": {"name": "Radeon Graphics (Ryzen 5000 iGPU)", "arch": "Vega", "gfx_target": "gfx90c", "override": None, "supported": False, "rec_backend": "cpu", "known_issues": [], "notes": "iGPU \u2014 ignore for AI."}
+    "1114": {"name": "Radeon 840M / 860M Graphics (Krackan)", "arch": "RDNA3.5", "gfx_target": "gfx1150", "override": None, "supported": True, "rec_backend": "vulkan", "known_issues": [], "notes": "Natively supported in modern ROCm."},
+    "164e": {"name": "Radeon Graphics (Ryzen 7000 iGPU)", "arch": "RDNA2", "gfx_target": "gfx1036", "override": None, "supported": False, "rec_backend": "cpu", "known_issues": [], "notes": "iGPU — ignore for AI."},
+    "1638": {"name": "Radeon Graphics (Ryzen 5000 iGPU)", "arch": "Vega", "gfx_target": "gfx90c", "override": None, "supported": False, "rec_backend": "cpu", "known_issues": [], "notes": "iGPU — ignore for AI."},
+    "15d8": {"name": "Radeon Vega (Picasso/Raven 2 iGPU)", "arch": "Vega", "gfx_target": "gfx90c", "override": None, "supported": False, "rec_backend": "cpu", "known_issues": [], "notes": "iGPU — ignore for AI."}
 }
 
 GPU_DATABASE = dict(FALLBACK_DATABASE)
@@ -102,7 +105,7 @@ def print_header():
     print(f"  ╚══════════════════════════════════════╝\n{C.RESET}")
 
 # ──────────────────────────────────────────────────────────────────────
-# 3. SUBPROCESS & EXECUTION UTILITIES
+# 3. SUBPROCESS UTILITIES
 # ──────────────────────────────────────────────────────────────────────
 
 def _run(cmd, shell=False, timeout=10):
@@ -1116,7 +1119,7 @@ def cmd_doctor(args):
             print(f"    {C.CYAN}Run: rocmfix install-rocm{C.RESET}")
 
     print(f"\n{C.BOLD}3. Vulkan{C.RESET}")
-    vk = _run(["vulkaninfo", "--summary"])
+    vk, _, _ = safe_run(["vulkaninfo", "--summary"])
     print(f"  {'✓' if ('Vulkan Instance Version' in vk or 'device' in vk.lower()) else '⚠'} Vulkan API")
 
     print(f"\n{C.BOLD}4. Env override{C.RESET}")
