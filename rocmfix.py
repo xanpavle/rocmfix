@@ -1023,6 +1023,8 @@ def cmd_doctor(args):
         if info:
             print(f"  For {g['name']}: Use {C.BOLD}{info.get('rec_backend','vulkan').upper()}{C.RESET} backend.")
             if info.get('override'): print(f"  Requires HSA_OVERRIDE_GFX_VERSION={info['override']} for HIP.")
+        else:
+            print(f"  For {g['name']}: {C.YELLOW}not in the GPU database.{C.RESET} Run `rocmfix` to generate a pre-filled report link.")
     print()
 
 def cmd_install_hip(args):
@@ -1422,7 +1424,9 @@ def cmd_list(args):
     print(f"  {'PCI':<6} {'Name':<40} {'Arch':<8} {'Override':<10} Status")
     print(f"  {'-'*6} {'-'*40} {'-'*8} {'-'*10} {'-'*6}")
     for pid, info in GPU_DATABASE.items():
-        st = f"{C.GREEN}Native{C.RESET}" if info.get("supported") else f"{C.YELLOW}Override{C.RESET}"
+        if info.get("supported"): st = f"{C.GREEN}Native{C.RESET}"
+        elif info.get("override"): st = f"{C.YELLOW}Override{C.RESET}"
+        else: st = f"{C.GRAY}Not for AI{C.RESET}"
         ov = info.get("override") or "-"
         print(f"  {pid:<6} {info['name']:<40} {info['arch']:<8} {ov:<10} {st}")
 
