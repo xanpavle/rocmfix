@@ -304,6 +304,10 @@ def _detect_linux() -> list[dict]:
             pci_id = match.group(1).lower()
             name_match = re.search(r"\]:\s*(.+?)\s*\[1002:", line)
             name = name_match.group(1) if name_match else "Unknown AMD GPU"
+            # Strip the pci.ids vendor prefix ("Advanced Micro Devices, Inc. [AMD/ATI]",
+            # "ATI Technologies Inc [AMD/ATI]", ...) so only the device name shows.
+            cleaned = re.sub(r"^(?:Advanced Micro Devices, Inc\.?|ATI Technologies Inc\.?)\s*(?:\[(?:AMD(?:/ATI)?|ATI)\]\s*)?", "", name).strip()
+            name = cleaned or name
             gpus.append({"pci_id": pci_id, "name": name, "driver_version": driver_ver, "raw_pnp": line.strip()})
     return gpus
 
