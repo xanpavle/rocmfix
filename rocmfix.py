@@ -355,17 +355,21 @@ def run_smoke_test(override):
             res = subprocess.run(["rocminfo"], capture_output=True, text=True, env=env, timeout=10)
             if res.returncode != 0 or "Agent" not in res.stdout:
                 return {"success": False, "message": "rocminfo failed.", "details": (res.stderr or res.stdout)[:300]}
-            gpu_count = res.stdout.count("Device Type:                     GPU")
+            gpu_count = len(re.findall(r"Device Type:\s+GPU\b", res.stdout))
             if gpu_count == 0:
-                # Check user group permissions
-                groups = _run(["groups"]).strip()
-                missing = []
-                if "render" not in groups: missing.append("render")
-                if "video" not in groups: missing.append("video")
-                if missing:
-                    details = f"Missing user groups: {', '.join(missing)}. Run: sudo usermod -aG render,video $USER"
+                # Check real device-node access before blaming group membership;
+                # some distros ship /dev/kfd and /dev/dri/renderD* with mode 666.
+                nodes = [Path("/dev/kfd")]
+                if Path("/dev/dri").is_dir():
+                    nodes += sorted(Path("/dev/dri").glob("renderD*"))
+                missing = [str(p) for p in nodes if not p.exists()]
+                denied = [str(p) for p in nodes if p.exists() and not os.access(p, os.R_OK | os.W_OK)]
+                if denied:
+                    details = f"No permission for {', '.join(denied)}. Run: sudo usermod -aG render,video $USER, then log out and back in."
+                elif missing:
+                    details = f"AMD device nodes missing: {', '.join(missing)}. Check that the amdgpu kernel driver is loaded (lsmod | grep amdgpu)."
                 else:
-                    details = "Needs HSA_OVERRIDE_GFX_VERSION set or ROCm service restart."
+                    details = "Device nodes are accessible but rocminfo lists no GPU agents. Try setting HSA_OVERRIDE_GFX_VERSION or restarting the ROCm userspace."
                 return {"success": False, "message": "0 GPU agents found by rocminfo.", "details": details}
             return {"success": True, "message": f"ROCm detected {gpu_count} GPU agent(s).", "details": f"override={override or 'not set'}"}
         except FileNotFoundError:
