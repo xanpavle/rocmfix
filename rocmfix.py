@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ROCmFix v0.1.6 — Cross-platform AMD GPU override detector for ROCm/HIP.
+ROCmFix v0.1.7 — Cross-platform AMD GPU override detector for ROCm/HIP.
 Single-file, zero external dependencies.
 """
 
@@ -17,12 +17,14 @@ import argparse
 import shutil
 import uuid
 import time
+import socket
 import webbrowser
 import glob
+import ctypes
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 GITHUB_REPO = "xanpavle/rocmfix"
 
 TELEMETRY_ENDPOINT = "https://rocmfix-data.onrender.com/submit"
@@ -40,6 +42,14 @@ DB_CACHE_TTL_HOURS = 24
 UPDATE_CHECK_TTL_HOURS = 168
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+# CPU-fallback thresholds (tok/s below these values for a given VRAM tier indicates likely CPU fallback)
+CPU_FALLBACK_HEURISTIC = {
+    "low_vram":     {"vram_gb_max": 8,  "min_expected_toks": 15},
+    "mid_vram":     {"vram_gb_max": 12, "min_expected_toks": 25},
+    "high_vram":    {"vram_gb_max": 16, "min_expected_toks": 35},
+    "flagship":     {"vram_gb_max": 999,"min_expected_toks": 45},
+}
 
 # ──────────────────────────────────────────────────────────────────────
 # 1. FALLBACK DATABASE
@@ -90,7 +100,6 @@ def enable_ansi():
         return
     if platform.system().lower() == "windows":
         try:
-            import ctypes
             k32 = ctypes.windll.kernel32
             k32.SetConsoleMode(k32.GetStdHandle(-11), 7)
         except Exception:
@@ -130,6 +139,17 @@ def safe_run(cmd, shell=False, env=None, timeout=30) -> tuple[str, str, int]:
         return res.stdout.strip(), res.stderr.strip(), res.returncode
     except Exception as e:
         return "", str(e), -1
+
+def wait_for_port(host: str, port: int, timeout: float = 15.0, poll_interval: float = 0.5) -> bool:
+    """Asynchronous port helper: polls a TCP socket until online or expired."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return True
+        except (OSError, socket.timeout):
+            time.sleep(poll_interval)
+    return False
 
 # ──────────────────────────────────────────────────────────────────────
 # 4. CONFIG MANAGEMENT
@@ -247,6 +267,25 @@ def sync_gpu_database(force: bool = False) -> str:
 
     GPU_DATABASE = dict(FALLBACK_DATABASE)
     return "fallback"
+
+def fetch_db_metadata_online() -> dict:
+    """Fetch online database status without local file system modifications."""
+    try:
+        req = urllib.request.Request(DATABASE_ENDPOINT, headers={"User-Agent": f"ROCmFix/{__version__}"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = json.loads(resp.read())
+            version_str = str(raw.get("version") or "unknown")
+            gpu_count = len(raw.get("gpus") or {})
+            age_str = "unknown"
+            try:
+                db_date = datetime.strptime(version_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                days_old = (datetime.now(timezone.utc) - db_date).days
+                age_str = f"{days_old} days old"
+            except Exception:
+                pass
+            return {"status": "ok", "version": version_str, "gpu_count": gpu_count, "age": age_str}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 # ──────────────────────────────────────────────────────────────────────
 # 6. UPDATE CHECKER
@@ -422,6 +461,93 @@ def analyze_driver(drv_ver: str):
     except Exception:
         return None
 
+def _estimate_vram_tier(gpu_name: str) -> tuple[int, str]:
+    """Analyze GPU model branding to estimate general VRAM size tier."""
+    n = (gpu_name or "").lower()
+    if any(k in n for k in ["7900 xtx", "7900xtx", "w7900"]): return (24, "flagship")
+    if any(k in n for k in ["7900 xt", "9070 xt", "9070", "6900", "6800", "w7800", "w7700"]): return (16, "high_vram")
+    if any(k in n for k in ["7800 xt", "7700 xt", "6700 xt"]): return (12, "mid_vram")
+    return (8, "low_vram")
+
+def vulkan_smoke_test_ctypes() -> dict:
+    """Uses ctypes to dynamically link and enumerate physical devices from Vulkan runtimes."""
+    try:
+        os_name = detect_os()
+        if os_name == "windows":
+            vk = ctypes.CDLL("vulkan-1.dll")
+        elif os_name == "linux":
+            try:
+                vk = ctypes.CDLL("libvulkan.so.1")
+            except OSError:
+                vk = ctypes.CDLL("libvulkan.so")
+        else:
+            return {"success": False, "device_count": 0, "message": "Unsupported OS"}
+    except OSError as e:
+        return {"success": False, "device_count": 0, "message": f"Vulkan API loader missing: {e}"}
+
+    class VkApplicationInfo(ctypes.Structure):
+        _fields_ = [
+            ("sType", ctypes.c_int),
+            ("pNext", ctypes.c_void_p),
+            ("pApplicationName", ctypes.c_char_p),
+            ("applicationVersion", ctypes.c_uint32),
+            ("pEngineName", ctypes.c_char_p),
+            ("engineVersion", ctypes.c_uint32),
+            ("apiVersion", ctypes.c_uint32),
+        ]
+
+    class VkInstanceCreateInfo(ctypes.Structure):
+        _fields_ = [
+            ("sType", ctypes.c_int),
+            ("pNext", ctypes.c_void_p),
+            ("flags", ctypes.c_uint32),
+            ("pApplicationInfo", ctypes.POINTER(VkApplicationInfo)),
+            ("enabledLayerCount", ctypes.c_uint32),
+            ("ppEnabledLayerNames", ctypes.c_void_p),
+            ("enabledExtensionCount", ctypes.c_uint32),
+            ("ppEnabledExtensionNames", ctypes.c_void_p),
+        ]
+
+    VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
+    VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1
+    VK_API_VERSION_1_0 = (1 << 22)
+
+    try:
+        app_info = VkApplicationInfo(
+            sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,
+            pNext=None,
+            pApplicationName=b"rocmfix",
+            applicationVersion=0,
+            pEngineName=b"rocmfix",
+            engineVersion=0,
+            apiVersion=VK_API_VERSION_1_0,
+        )
+        create_info = VkInstanceCreateInfo(
+            sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            pNext=None,
+            flags=0,
+            pApplicationInfo=ctypes.pointer(app_info),
+            enabledLayerCount=0,
+            ppEnabledLayerNames=None,
+            enabledExtensionCount=0,
+            ppEnabledExtensionNames=None,
+        )
+        instance = ctypes.c_void_p()
+        res = vk.vkCreateInstance(ctypes.byref(create_info), None, ctypes.byref(instance))
+        if res != 0:
+            return {"success": False, "device_count": 0, "message": f"vkCreateInstance failed (code {res})"}
+
+        count = ctypes.c_uint32(0)
+        vk.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), None)
+        device_count = count.value
+        vk.vkDestroyInstance(instance, None)
+
+        if device_count == 0:
+            return {"success": False, "device_count": 0, "message": "Vulkan runtimes loaded but found 0 physical devices"}
+        return {"success": True, "device_count": device_count, "message": f"Vulkan detected {device_count} device(s)"}
+    except Exception as e:
+        return {"success": False, "device_count": 0, "message": f"Dynamic API test failed: {e}"}
+
 # ──────────────────────────────────────────────────────────────────────
 # 8. SMOKE TESTING
 # ──────────────────────────────────────────────────────────────────────
@@ -465,21 +591,29 @@ def run_smoke_test(override):
 
     if os_name == "windows":
         hip_path = os.environ.get("HIP_PATH", "")
+        hipinfo_valid = False
+        if hip_path:
+            hipinfo = os.path.join(hip_path, "bin", "hipInfo.exe")
+            if os.path.exists(hipinfo):
+                hipinfo_valid = True
+                try:
+                    res = subprocess.run([hipinfo], capture_output=True, text=True, env=env,
+                                         timeout=15, encoding="utf-8", errors="replace")
+                except Exception as e:
+                    return {"success": False, "message": str(e), "details": ""}
+                if res.returncode == 0 and "device" in res.stdout.lower():
+                    return {"success": True, "message": "HIP SDK detected your GPU.",
+                            "details": f"override={override or 'not set'}"}
+
+        # Fallback to pure ctypes-based Vulkan verification if HIP driver tools are missing
+        vk_res = vulkan_smoke_test_ctypes()
+        if vk_res["success"]:
+            notes = " (HIP missing, fallback Vulkan interface operational)" if not hipinfo_valid else ""
+            return {"success": True, "message": f"{vk_res['message']}{notes}", "details": f"override={override or 'not set'}"}
+
         if not hip_path:
-            return {"success": False, "message": "HIP_PATH not set.", "details": "Run 'rocmfix install-hip'"}
-        hipinfo = os.path.join(hip_path, "bin", "hipInfo.exe")
-        if not os.path.exists(hipinfo):
-            return {"success": False, "message": "hipInfo.exe not found.", "details": f"Looked in: {hip_path}\\bin\\"}
-        try:
-            res = subprocess.run([hipinfo], capture_output=True, text=True, env=env,
-                                 timeout=15, encoding="utf-8", errors="replace")
-        except Exception as e:
-            return {"success": False, "message": str(e), "details": ""}
-        if res.returncode != 0:
-            return {"success": False, "message": "hipInfo returned error.", "details": (res.stderr or res.stdout)[:300]}
-        if "device" not in res.stdout.lower():
-            return {"success": False, "message": "No devices found.", "details": res.stdout[:300]}
-        return {"success": True, "message": "HIP SDK detected your GPU.", "details": f"override={override or 'not set'}"}
+            return {"success": False, "message": "HIP_PATH env missing + Vulkan pipeline failure.", "details": "Run 'rocmfix install-hip'"}
+        return {"success": False, "message": "HIP diagnostics failed and Vulkan interfaces failed to link.", "details": f"Vulkan status: {vk_res['message']}"}
 
     return {"success": False, "message": "Unsupported OS", "details": ""}
 
@@ -585,7 +719,7 @@ def undo_last_override() -> dict:
 
     target = last.get("file")
     if not target:
-        return {"success": False, "error": "This entry has no file path (created by older version). Use backup: " + str(last.get("backup"))}
+        return {"success": False, "error": "This entry has no file path. Use backup: " + str(last.get("backup"))}
     tp = Path(target)
     try:
         if not tp.exists():
@@ -617,7 +751,7 @@ def undo_last_override() -> dict:
 def build_telemetry_payload(gpu, info, rocm_ver, smoke_result=None, benchmark=None):
     cfg = load_config()
     payload = {
-        "schema_version": 2, "user_id": cfg["user_id"], "rocmfix_version": __version__,
+        "schema_version": 3, "user_id": cfg["user_id"], "rocmfix_version": __version__,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "os": detect_os(), "shell": detect_shell(),
         "gpu": {"name": gpu.get("name"), "pci_id": gpu.get("pci_id"),
@@ -760,43 +894,95 @@ def get_issue_url(gpu, rocm_ver):
     return f"https://github.com/{GITHUB_REPO}/issues/new?{params}"
 
 # ─── 12. DUAL-BACKEND BENCHMARK HELPER (VULKAN VS HIP) ─────────────
-def find_lm_studio_models() -> list[str]:
-    home = Path.home()
-    candidates = [
-        home / ".cache" / "lm-studio" / "models",
-        home / ".lmstudio" / "models",
-        home / "AppData" / "Roaming" / "LMStudio" / "models",
-    ]
-    models = []
-    for base in candidates:
-        if base.exists():
-            for gguf in base.rglob("*.gguf"):
-                models.append(str(gguf))
-    return models
-
-def _lms_api(method: str, path: str, body: dict | None = None, timeout: int = 180):
-    data = None if body is None else json.dumps(body).encode("utf-8")
+def _stream_chat_completions(base_url: str, payload: dict, timeout: int = 180) -> dict:
+    """Streams token chunks from an OpenAI-compatible endpoint to isolate TTFT and Decode metrics."""
+    payload = dict(payload)
+    payload["stream"] = True
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        f"http://127.0.0.1:1234{path}",
+        f"{base_url}/v1/chat/completions",
         data=data,
-        method=method,
+        method="POST",
         headers={
             "Content-Type": "application/json",
-            "Authorization": "Bearer lm-studio",
+            "Accept": "text/event-stream",
+            "Authorization": "Bearer rocmfix",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        return json.loads(raw) if raw else {}
 
-def _unload_lmstudio(env: dict, model_id: str | None = None):
-    cmds = [["lms", "unload", "--all"], ["lms", "unload", "-a"]]
-    if model_id: cmds.insert(0, ["lms", "unload", str(model_id)])
-    for cmd in cmds: safe_run(cmd, env=env, timeout=15)
-    time.sleep(2)
+    start_time = time.time()
+    first_token_time = None
+    last_token_time = None
+    token_count = 0
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                body = line[5:].strip()
+                if body == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(body)
+                except Exception:
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    now = time.time()
+                    if first_token_time is None:
+                        first_token_time = now
+                    last_token_time = now
+                    token_count += 1
+    except Exception as e:
+        return {"error": f"Streaming pipeline aborted: {e}"}
+
+    total_duration = max(time.time() - start_time, 0.001)
+    if first_token_time is None:
+        return {"error": "Server did not stream back any content tokens."}
+
+    ttft_s = first_token_time - start_time
+    decode_duration = max((last_token_time or first_token_time) - first_token_time, 0.001)
+    decode_toks_per_s = round(token_count / decode_duration, 2)
+
+    return {
+        "ttft_s": round(ttft_s, 3),
+        "decode_duration_s": round(decode_duration, 3),
+        "decode_toks": token_count,
+        "decode_toks_per_s": decode_toks_per_s,
+        "total_time_s": round(total_duration, 3),
+    }
+
+def check_cpu_fallback(gpu_name: str, best_decode_toks_s: float) -> dict | None:
+    """Verifies if generation throughput aligns with hardware-accelerated thresholds."""
+    if best_decode_toks_s <= 0:
+        return None
+    vram_gb, tier = _estimate_vram_tier(gpu_name)
+    thresh = CPU_FALLBACK_HEURISTIC.get(tier, {}).get("min_expected_toks", 10)
+
+    if best_decode_toks_s < thresh * 0.4:
+        return {
+            "level": "critical",
+            "message": (f"Measured speed ({best_decode_toks_s} t/s) is critically below "
+                        f"the ~{thresh}+ t/s expectation for {gpu_name} ({vram_gb}GB). "
+                        f"Device is highly likely running on CPU fallback! Check overrides.")
+        }
+    elif best_decode_toks_s < thresh * 0.7:
+        return {
+            "level": "warn",
+            "message": (f"Measured speed ({best_decode_toks_s} t/s) is subpar "
+                        f"for {gpu_name}. Performance may be bottlenecked by "
+                        f"partial CPU layer offloading.")
+        }
+    return None
 
 def bench_via_lmstudio(gpu_override: str | None) -> dict:
-    """Run dual-backend benchmark (Vulkan vs HIP) via LM Studio."""
+    """Run dual-backend benchmark (Vulkan vs HIP) via LM Studio with streaming token analysis."""
     lms_cli = shutil.which("lms") is not None
     
     server_running = False
@@ -811,9 +997,9 @@ def bench_via_lmstudio(gpu_override: str | None) -> dict:
         flags = 0x08000000 if detect_os() == "windows" else 0
         try:
             subprocess.Popen(["lms", "server", "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, creationflags=flags)
-            time.sleep(3)
-            models_data = _lms_api("GET", "/v1/models", timeout=5)
-            server_running = True
+            if wait_for_port("127.0.0.1", 1234, timeout=10):
+                models_data = _lms_api("GET", "/v1/models", timeout=5)
+                server_running = True
         except Exception:
             pass
 
@@ -845,18 +1031,22 @@ def bench_via_lmstudio(gpu_override: str | None) -> dict:
         return {"error": "No models found in LM Studio. Download a model in LM Studio first."}
 
     print(f"  Model: {chosen_model}\n")
-    results = {"runtime": "lm_studio", "model": chosen_model, "vulkan_toks": 0.0, "hip_toks": 0.0, "winner": "tie"}
+    results = {
+        "runtime": "lm_studio", "model": chosen_model,
+        "vulkan": {}, "hip": {},
+        "vulkan_toks": 0.0, "hip_toks": 0.0,
+        "winner": "tie"
+    }
 
     prompt_payload = {
         "model": chosen_model,
         "messages": [{"role": "user", "content": "Write a 40 word story about a robot."}],
         "max_tokens": 64,
-        "stream": False,
         "temperature": 0.0
     }
 
-    # Dual-Pass Benchmark: Test VULKAN, then test HIP
     for backend in ["vulkan", "rocm"]:
+        backend_key = "vulkan" if backend == "vulkan" else "hip"
         print(f"  Testing {C.BOLD}{backend.upper()}{C.RESET}...")
         env = os.environ.copy()
         env["OLLAMA_GPU_BACKEND"] = backend
@@ -875,22 +1065,21 @@ def bench_via_lmstudio(gpu_override: str | None) -> dict:
         except Exception:
             pass
 
-        time.sleep(3)
+        if not wait_for_port("127.0.0.1", 1234, timeout=15):
+            print(f"    {C.RED}→ LM Studio backend did not bind to port 1234 within 15 seconds.{C.RESET}")
+            continue
+
         safe_run(["lms", "load", chosen_model, "-y"], env=env, timeout=120)
-        time.sleep(3)
+        time.sleep(2)
 
         try:
-            start = time.time()
-            data = _lms_api("POST", "/v1/chat/completions", prompt_payload, timeout=180)
-            elapsed = max(time.time() - start, 0.001)
-            usage = data.get("usage") or {}
-            toks = usage.get("completion_tokens") or 32
-            tok_s = round(toks / elapsed, 2)
-            results[f"{'vulkan' if backend=='vulkan' else 'hip'}_toks"] = tok_s
-            print(f"    {C.GREEN}→ {tok_s} tok/s{C.RESET}")
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
-            print(f"    {C.RED}→ HTTP {e.code}: {body[:100]}{C.RESET}")
+            stream_metrics = _stream_chat_completions("http://127.0.0.1:1234", prompt_payload, timeout=180)
+            if "error" in stream_metrics:
+                print(f"    {C.RED}→ {stream_metrics['error']}{C.RESET}")
+            else:
+                results[backend_key] = stream_metrics
+                results[f"{backend_key}_toks"] = stream_metrics["decode_toks_per_s"]
+                print(f"    {C.GREEN}→ decode {stream_metrics['decode_toks_per_s']} tok/s | TTFT {stream_metrics['ttft_s']*1000:.0f}ms{C.RESET}")
         except Exception as e:
             print(f"    {C.RED}→ Failed: {e}{C.RESET}")
 
@@ -901,8 +1090,46 @@ def bench_via_lmstudio(gpu_override: str | None) -> dict:
     results["winner"] = "vulkan" if vk > hp else "hip" if hp > vk else "tie"
     return results
 
-def _ollama_installed() -> bool:
-    return shutil.which("ollama") is not None
+def bench_via_llamacpp(gpu_override: str | None, custom_url: str | None = None) -> dict:
+    """Benchmark an active llama.cpp server using direct token timing evaluations."""
+    target_url = (custom_url or os.environ.get("ROCMFIX_LLAMA_CPP_URL") or "http://127.0.0.1:8080").rstrip("/")
+    try:
+        req = urllib.request.Request(f"{target_url}/v1/models")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            models_data = json.loads(resp.read())
+    except Exception as e:
+        return {"error": f"llama.cpp server not accessible at {target_url}: {e}"}
+
+    models_list = [m.get("id") for m in (models_data.get("data") or []) if m.get("id")]
+    active_model = models_list[0] if models_list else "unknown"
+    print(f"  Model: {active_model}")
+    print(f"  URL:   {target_url}\n")
+
+    prompt_payload = {
+        "model": active_model,
+        "messages": [{"role": "user", "content": "Write a 40 word story about a robot."}],
+        "max_tokens": 64,
+        "temperature": 0.0
+    }
+
+    print(f"  Testing {C.BOLD}llama.cpp native binary{C.RESET}...")
+    stream_metrics = _stream_chat_completions(target_url, prompt_payload, timeout=180)
+    if "error" in stream_metrics:
+        return {"error": stream_metrics["error"]}
+
+    print(f"    {C.GREEN}→ decode {stream_metrics['decode_toks_per_s']} tok/s | TTFT {stream_metrics['ttft_s']*1000:.0f}ms{C.RESET}")
+
+    return {
+        "runtime": "llama_cpp",
+        "model": active_model,
+        "endpoint": target_url,
+        "single_backend": True,
+        "backend": "unknown",
+        "measurement": stream_metrics,
+        "vulkan_toks": 0.0,
+        "hip_toks": 0.0,
+        "winner": "n/a",
+    }
 
 def bench_via_ollama(gpu_override: str | None) -> dict:
     """Run dual-backend benchmark (Vulkan vs HIP) via isolated Ollama server."""
@@ -917,14 +1144,20 @@ def bench_via_ollama(gpu_override: str | None) -> dict:
     model = models[0]
     prompt = "Write a short 30 word story."
     print(f"  Model: {model}\n")
-    results = {"runtime": "ollama", "model": model, "vulkan_toks": 0.0, "hip_toks": 0.0, "winner": "tie"}
+    results = {
+        "runtime": "ollama", "model": model,
+        "vulkan": {}, "hip": {},
+        "vulkan_toks": 0.0, "hip_toks": 0.0,
+        "winner": "tie"
+    }
 
     for backend in ["vulkan", "rocm"]:
+        backend_key = "vulkan" if backend == "vulkan" else "hip"
         print(f"  Testing {C.BOLD}{backend.upper()}{C.RESET}...")
         
         env = os.environ.copy()
         env["OLLAMA_GPU_BACKEND"] = backend
-        env["OLLAMA_HOST"] = "127.0.0.1:11435"  # ISOLATED PORT TO PREVENT KILLING USER OLLAMA
+        env["OLLAMA_HOST"] = "127.0.0.1:11435"
         if gpu_override:
             env["HSA_OVERRIDE_GFX_VERSION"] = gpu_override
 
@@ -934,18 +1167,44 @@ def bench_via_ollama(gpu_override: str | None) -> dict:
             print(f"    {C.RED}→ Failed to launch isolated Ollama server: {e}{C.RESET}")
             continue
 
-        time.sleep(4)
+        # Wait until local Ollama port binds successfully before making request
+        if not wait_for_port("127.0.0.1", 11435, timeout=15):
+            print(f"    {C.RED}→ Isolated Ollama port binding timed out after 15 seconds.{C.RESET}")
+            try: proc.kill()
+            except: pass
+            continue
+
         try:
             req = urllib.request.Request(
                 "http://127.0.0.1:11435/api/generate",
                 data=json.dumps({"model": model, "prompt": prompt, "stream": False}).encode(),
                 headers={"Content-Type": "application/json"}
             )
+            start_wall = time.time()
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = json.loads(resp.read())
-                tok_s = round(data.get("eval_count", 0) / (data.get("eval_duration", 1) / 1e9), 2)
-                results[f"{'vulkan' if backend=='vulkan' else 'hip'}_toks"] = tok_s
-                print(f"    {C.GREEN}→ {tok_s} tok/s{C.RESET}")
+                wall_time = max(time.time() - start_wall, 0.001)
+                
+                prompt_tokens = data.get("prompt_eval_count", 0)
+                prompt_eval_ns = data.get("prompt_eval_duration", 0) or 1
+                gen_tokens = data.get("eval_count", 0)
+                eval_ns = data.get("eval_duration", 0) or 1
+                load_ns = data.get("load_duration", 0) or 0
+
+                prompt_toks_s = round(prompt_tokens / (prompt_eval_ns / 1e9), 2) if prompt_tokens else 0.0
+                decode_toks_s = round(gen_tokens / (eval_ns / 1e9), 2) if gen_tokens else 0.0
+                ttft_s = round((load_ns + prompt_eval_ns) / 1e9, 3)
+
+                results[backend_key] = {
+                    "ttft_s": ttft_s,
+                    "prompt_toks": prompt_tokens,
+                    "prompt_toks_per_s": prompt_toks_s,
+                    "decode_toks": gen_tokens,
+                    "decode_toks_per_s": decode_toks_s,
+                    "total_time_s": round(wall_time, 3),
+                }
+                results[f"{backend_key}_toks"] = decode_toks_s
+                print(f"    {C.GREEN}→ prefill {prompt_toks_s} tok/s | decode {decode_toks_s} tok/s | TTFT {ttft_s*1000:.0f}ms{C.RESET}")
         except Exception as e:
             print(f"    {C.RED}→ Failed: {e}{C.RESET}")
 
@@ -964,10 +1223,23 @@ def cmd_bench(args):
     has_ollama = _ollama_installed()
     lms_models = find_lm_studio_models()
     has_lms = bool(shutil.which("lms")) or bool(lms_models)
+    
+    # Simple check to see if llama.cpp server is reachable
+    has_llamacpp = False
+    llama_url = os.environ.get("ROCMFIX_LLAMA_CPP_URL") or "http://127.0.0.1:8080"
+    try:
+        req = urllib.request.Request(f"{llama_url}/v1/models")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if 200 <= resp.status < 300:
+                has_llamacpp = True
+    except Exception:
+        pass
 
     print(f"{C.BOLD}Detected AI runtimes:{C.RESET}")
     print(f"  {'✓ Ollama' if has_ollama else '✗ Ollama'}")
-    print(f"  {'✓ LM Studio' if has_lms else '✗ LM Studio'}\n")
+    print(f"  {'✓ LM Studio' if has_lms else '✗ LM Studio'}")
+    print(f"  {'✓ llama.cpp server (' + llama_url + ')' if has_llamacpp else '✗ llama.cpp server'}")
+    print()
 
     gpus = detect_gpus()
     gpu_override = None
@@ -978,15 +1250,14 @@ def cmd_bench(args):
             gpu_override = info["override"]
 
     result = None
+    forced = getattr(args, "runtime", None)
 
-    # 1. Try LM Studio first if available
-    if has_lms:
-        print(f"  Benchmarking via {C.BOLD}LM Studio{C.RESET}...")
+    # 1. Run Benchmark on Selected Target
+    if forced == "llamacpp" or (not forced and has_llamacpp):
+        result = bench_via_llamacpp(gpu_override)
+    elif forced == "lmstudio" or (not forced and has_lms):
         result = bench_via_lmstudio(gpu_override)
-
-    # 2. Try Ollama if LM Studio failed or wasn't present
-    if (not result or "error" in result) and has_ollama:
-        print(f"  Benchmarking via {C.BOLD}Ollama{C.RESET}...")
+    elif forced == "ollama" or (not forced and has_ollama):
         result = bench_via_ollama(gpu_override)
 
     if not result or "error" in result:
@@ -994,17 +1265,50 @@ def cmd_bench(args):
         print(f"  {C.RED}✗ {err_msg}{C.RESET}\n")
         return
 
-    vk, hp = result["vulkan_toks"], result["hip_toks"]
-    print(f"\n{C.BOLD}🏆 Results:{C.RESET}")
-    print(f"  Vulkan: {vk} tok/s")
-    print(f"  HIP/ROCm: {hp} tok/s")
-
-    if vk > hp and vk > 0:
-        print(f"\n  {C.GREEN}Winner: VULKAN (+{int((vk/hp-1)*100 if hp else 0)}%){C.RESET}")
-    elif hp > vk and hp > 0:
-        print(f"\n  {C.GREEN}Winner: HIP/ROCm (+{int((hp/vk-1)*100 if vk else 0)}%){C.RESET}")
+    # 2. Print Detailed Benchmark Table
+    print(f"\n{C.BOLD}🏆 Results:{C.RESET}\n")
+    if result.get("single_backend"):
+        m = result.get("measurement") or {}
+        print(f"  Runtime: llama.cpp server")
+        print(f"  Model:   {result.get('model')}")
+        print(f"  TTFT:    {m.get('ttft_s', 0)*1000:.0f} ms")
+        print(f"  Decode:  {m.get('decode_toks_per_s', 0)} tok/s ({m.get('decode_toks', 0)} tokens in {m.get('decode_duration_s', 0)}s)")
+        best_decode = m.get("decode_toks_per_s", 0.0)
     else:
-        print(f"\n  {C.YELLOW}No clear winner or single backend tested.{C.RESET}")
+        vk = result.get("vulkan") or {}
+        hp = result.get("hip") or {}
+        
+        col_hdr = f"  {'Backend':<10} {'TTFT (ms)':>12} {'Prefill t/s':>14} {'Decode t/s':>14}"
+        print(col_hdr)
+        print(f"  {'-'*10} {'-'*12} {'-'*14} {'-'*14}")
+        
+        def _print_metrics(label, d):
+            ttft = f"{(d.get('ttft_s') or 0)*1000:.0f}" if d.get("ttft_s") is not None else "-"
+            pre = f"{d.get('prompt_toks_per_s', '-')}" if d.get("prompt_toks_per_s") is not None else "-"
+            dec = f"{d.get('decode_toks_per_s', 0)}"
+            print(f"  {label:<10} {ttft:>12} {pre:>14} {dec:>14}")
+
+        _print_metrics("Vulkan", vk)
+        _print_metrics("HIP/ROCm", hp)
+
+        vk_dec = result.get("vulkan_toks", 0.0)
+        hp_dec = result.get("hip_toks", 0.0)
+        best_decode = max(vk_dec, hp_dec)
+
+        if vk_dec > hp_dec and vk_dec > 0:
+            print(f"\n  {C.GREEN}Winner: VULKAN (+{int((vk_dec/hp_dec-1)*100 if hp_dec else 0)}%){C.RESET}")
+        elif hp_dec > vk_dec and hp_dec > 0:
+            print(f"\n  {C.GREEN}Winner: HIP/ROCm (+{int((hp_dec/vk_dec-1)*100 if vk_dec else 0)}%){C.RESET}")
+        else:
+            print(f"\n  {C.YELLOW}No clear performance delta detected.{C.RESET}")
+
+    # Warn if generation speeds point toward CPU execution fallback
+    if target_gpu:
+        fallback_alert = check_cpu_fallback(target_gpu.get("name", ""), best_decode)
+        if fallback_alert:
+            alert_color = C.RED if fallback_alert["level"] == "critical" else C.YELLOW
+            alert_icon = "✗" if fallback_alert["level"] == "critical" else "⚠"
+            print(f"\n  {alert_color}{alert_icon} PERFORMANCE ALERT: {fallback_alert['message']}{C.RESET}")
 
     cfg = load_config()
     if cfg.get("telemetry_enabled") and target_gpu:
@@ -1119,8 +1423,15 @@ def cmd_doctor(args):
             print(f"    {C.CYAN}Run: rocmfix install-rocm{C.RESET}")
 
     print(f"\n{C.BOLD}3. Vulkan{C.RESET}")
-    vk, _, _ = safe_run(["vulkaninfo", "--summary"])
-    print(f"  {'✓' if ('Vulkan Instance Version' in vk or 'device' in vk.lower()) else '⚠'} Vulkan API")
+    vk_ct = vulkan_smoke_test_ctypes()
+    if vk_ct["success"]:
+        print(f"  {C.GREEN}✓ Vulkan interface:{C.RESET} {vk_ct['message']}")
+    else:
+        vk, _, _ = safe_run(["vulkaninfo", "--summary"])
+        if "Vulkan Instance Version" in vk or "device" in vk.lower():
+            print(f"  {C.GREEN}✓ Vulkan API interface active{C.RESET}")
+        else:
+            print(f"  {C.YELLOW}⚠ Vulkan pipeline diagnostic failed:{C.RESET} {vk_ct['message']}")
 
     print(f"\n{C.BOLD}4. Env override{C.RESET}")
     ov = os.environ.get("HSA_OVERRIDE_GFX_VERSION")
@@ -1273,6 +1584,30 @@ def cmd_list(args):
         ov = info.get("override") or "-"
         print(f"  {pid:<6} {info['name']:<44} {info['arch']:<8} {ov:<10} {st}")
 
+def cmd_gpus(args):
+    print_header()
+    if getattr(args, "online", False):
+        print(f"{C.BOLD}Checking online database version...{C.RESET}\n")
+        meta = fetch_db_metadata_online()
+        if meta["status"] == "ok":
+            print(f"  Server URL: {DATABASE_ENDPOINT}")
+            print(f"  Version:    {C.BOLD}{meta['version']}{C.RESET}")
+            print(f"  GPUs:       {meta['gpu_count']}")
+            print(f"  Age:        {meta['age']}\n")
+            cfg = load_config()
+            last_sync = cfg.get("last_db_sync")
+            if last_sync:
+                try:
+                    sync_time = datetime.fromisoformat(last_sync)
+                    diff = datetime.now(timezone.utc) - sync_time
+                    hours = int(diff.total_seconds() // 3600)
+                    print(f"  Local cache synced: {hours} hour(s) ago")
+                except Exception:
+                    pass
+        else:
+            print(f"  {C.RED}✗ Cloud database unreachable: {meta.get('error')}{C.RESET}\n")
+    cmd_list(args)
+
 def cmd_undo(args):
     print_header()
     r = undo_last_override()
@@ -1338,15 +1673,18 @@ def main():
     p.add_argument("command", nargs="?", default="detect",
                    choices=["detect","test","list","contribute","install","verify",
                             "undo","telemetry","doctor","install-hip","install-rocm",
-                            "bench","update","export","sync","optimize"])
+                            "bench","update","export","sync","optimize","gpus"])
+    p.add_argument("--online", action="store_true", help="Fetch online database age (for 'gpus' command)")
+    p.add_argument("--runtime", choices=["ollama", "lmstudio", "llamacpp"], help="Select benchmark model target")
     args = p.parse_args()
+    
     disp = {
         "detect": cmd_detect, "test": cmd_test, "list": cmd_list, "verify": cmd_verify,
         "contribute": cmd_contribute, "install": lambda a: install_globally(),
         "undo": cmd_undo, "telemetry": cmd_telemetry, "doctor": cmd_doctor,
         "install-hip": cmd_install_hip, "install-rocm": cmd_install_rocm,
         "bench": cmd_bench, "update": cmd_update, "export": cmd_export,
-        "sync": cmd_sync, "optimize": cmd_optimize,
+        "sync": cmd_sync, "optimize": cmd_optimize, "gpus": cmd_gpus,
     }
     
     try:
