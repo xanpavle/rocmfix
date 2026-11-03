@@ -23,7 +23,7 @@ body:
     attributes:
       label: PCI Device ID
       description: "4 hex characters. Run `python rocmfix.py` to find yours."
-      placeholder: "7470"
+      placeholder: "747e"
     validations:
       required: true
 
@@ -33,7 +33,8 @@ body:
       label: Architecture
       options:
         - RDNA4 (RX 9000 series)
-        - RDNA3 (RX 7000 series)
+        - RDNA3 (RX 7000 series, 780M iGPU)
+        - RDNA3.5 (Strix Halo / Strix Point iGPU)
         - RDNA2 (RX 6000 series)
         - RDNA1 (RX 5000 series)
         - Vega (RX Vega / Radeon VII)
@@ -47,7 +48,7 @@ body:
     id: gfx-target
     attributes:
       label: Real GFX Target
-      description: "Run `rocminfo | grep gfx` on Linux, or check AMD docs. e.g. gfx1101"
+      description: "Run `python rocmfix.py` (it reads it from the driver), or `rocminfo | grep gfx` on Linux. e.g. gfx1101"
       placeholder: "gfx1101"
     validations:
       required: false

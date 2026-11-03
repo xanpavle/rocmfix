@@ -1,42 +1,61 @@
 # ROCmFix Privacy Policy
 
-## What ROCmFix collects (only if you opt in)
+Telemetry is **off until you say yes**. ROCmFix asks once on first run, and you can
+change your mind any time with `rocmfix telemetry`.
 
-- **GPU model name** (e.g. "RX 7800 XT")
-- **PCI device ID** (e.g. "7470")
+## What ROCmFix sends (only if you opt in)
+
+- **GPU model name** (e.g. "AMD Radeon RX 7800 XT")
+- **PCI device ID** (e.g. "747e") and **gfx target** (e.g. "gfx1101")
 - **Driver version** (e.g. "32.0.31041.1004")
-- **Operating system** (e.g. "windows")
-- **ROCm/HIP version** if installed
-- **Override value used** (e.g. "11.0.0")
-- **Smoke test result** (pass/fail)
-- **Random anonymous user ID** (generated once, stored locally)
+- **Operating system** (e.g. "windows") and **shell** (e.g. "powershell")
+- **ROCm/HIP version**, if installed
+- **Recommendation shown** (native / override value) and **smoke test result** (pass/fail)
+- **Benchmark numbers** from `rocmfix bench`: runtime (Ollama / LM Studio / llama.cpp),
+  backend, tokens per second, time to first token, and the model's **size class and
+  quantization only** (e.g. "8B Q4_K_M")
+- **Random anonymous install ID** (generated once, stored locally)
 - **ROCmFix version and timestamp**
 
-## What ROCmFix does NOT collect
+## What ROCmFix never sends
 
 - Your name, username, or email
-- Your IP address (Cloudflare Tunnel strips this)
-- File paths or filenames on your computer
-- Model files or model names you use
-- Any content you generate with AI
-- Any personal or system information beyond GPU specs
+- **Model names** or model file names
+- Server addresses or URLs (e.g. your llama.cpp server)
+- File paths on your computer
+- Prompts or anything an AI model generates
+- Anything else about your system beyond the list above
 
-## How to opt out
+ROCmFix versions 0.1.7 and older included the model name and llama.cpp server URL in
+benchmark reports. The collector now deletes those fields before storing anything.
 
-Run: `rocmfix telemetry` and choose Disable.
+## Your IP address
+
+Like any web request, the collector server sees the IP address the report comes from,
+and the hosting provider (Render) may keep it in short-lived access logs. The IP is
+**not stored with the report** and is not used for anything.
 
 ## How to see exactly what gets sent
 
-Run: `rocmfix telemetry`, then press `S` to view a sample payload.
+Run `rocmfix telemetry`, then press `S` to view a sample payload.
+
+## How to opt out
+
+Run `rocmfix telemetry` and choose Disable.
 
 ## Where data is stored
 
-Anonymous reports are sent to a private server run by the ROCmFix maintainer.
-Data is used to expand the GPU database, detect driver regressions, and
-improve override recommendations.
+Reports go to a collector run by the ROCmFix maintainer and are stored in a private
+database. The data is used to expand the GPU database, spot driver regressions,
+improve override recommendations, and publish aggregate benchmark statistics.
 
-## Data queue when offline
+## Offline queue
 
-If the collector server is unreachable, reports are saved to
-`~/.rocmfix/outbox/` and sent on the next successful run. This means your PC
-never blocks or fails waiting for the server.
+If the collector is unreachable, reports are saved to `~/.rocmfix/outbox/` (at most
+100) and sent on the next successful run, so ROCmFix never blocks waiting for the server.
+
+## Local-only files
+
+`rocmfix bench` keeps a local history in `~/.rocmfix/bench_history.json` so it can
+compare backends across runs. That file includes model names and **never leaves your
+computer**.
